@@ -1144,6 +1144,24 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
+    /// Of the title slots `among`, in their order, those the queue holds
+    /// due for an upload at `frame`, with the write each was handed out as:
+    /// a bake's own sources, which go first in the pass before it.
+    /// (From ka1qux/BRVIctory-ka1qux 19da76b.)
+    pub(crate) fn texture_slots_due_of(&self, frame: u64, among: &[u32]) -> Vec<(u32, u64)> {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(u32, u64)> = Vec::new();
+        for &index in among {
+            if out.iter().any(|&(i, _)| i == index) {
+                continue;
+            }
+            if let Some(w) = textures.slots.get(&index).filter(|w| w.due <= frame) {
+                out.push((index, w.write));
+            }
+        }
+        out
+    }
+
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
