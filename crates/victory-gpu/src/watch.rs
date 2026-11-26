@@ -2104,16 +2104,15 @@ impl Drop for KernelWrite {
 /// 2, the placed textures picked by index that lie under it are due again;
 /// 4, both also for reads to plain addresses when they have finished;
 /// 8, for reads to plain addresses the textures alone (bit 2's look).
-/// Unset: bits 1, 2 and 8. `guards`: bit 1 alone (the default until
-/// 2026-11-26). `0`: nothing, counted only (the default until run 199).
-/// `1`: bits 1 and 2. `slots`: bit 2 alone. `all`: everything.
+/// Unset or `guards`: bit 1 alone. `faces`: bits 1, 2 and 8. `0`: nothing,
+/// counted only (the default until run 199). `1`: bits 1 and 2. `slots`:
+/// bit 2 alone. `all`: everything.
 ///
-/// Bits 2 and 8 by default (after fxceless/victory-fork e4245f3, GPL-3.0-or-
-/// later: the black faces of the opening cutscene): textures uploaded while
-/// a read into their pages was under way kept the bytes from before it, and
-/// nothing asked again once the bytes were there. Only slots uploaded before
-/// the bytes landed are made due again
-/// (`HostHeap::texture_slots_page_written`).
+/// `faces` is fxceless/victory-fork e4245f3's default (GPL-3.0-or-later: the
+/// black faces of the opening cutscene, textures uploaded while a read into
+/// their pages was under way). Not ours: in run 159 (cool_fox base, Series S)
+/// the cell's sheet-music posters turned to black-and-white noise between
+/// frames 3304 and 3800 with it, and in no run without it.
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
@@ -2127,7 +2126,8 @@ pub(crate) fn page_writes() -> u8 {
         Ok("slots") => 2,
         Ok("guards") => 1,
         Ok("all") => 15,
-        _ => 1 | 2 | 8,
+        Ok("faces") => 1 | 2 | 8,
+        _ => 1,
     })
 }
 
