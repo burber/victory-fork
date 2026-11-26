@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod upscale;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

@@ -3153,6 +3153,17 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        // FSR 4's last pass, replaced by a plain upscale (`crate::upscale`).
+        if crate::upscale::on()
+            && p.stages.first().is_some_and(|s| s.shader.hash == crate::upscale::LAST_PASS)
+            && self.simple_upscale(list, p)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            self.buffers_written();
+            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -3164,6 +3175,56 @@ impl State {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
+    }
+
+    /// The plain upscale in place of a dispatch of `p`, FSR 4's last pass
+    /// (`crate::upscale`), from the views it is bound to. Whether it recorded
+    /// anything (if not, the title's pass runs).
+    fn simple_upscale(&self, list: &HostList, p: &HostPipeline) -> bool {
+        use crate::upscale::{SOURCE_AT, TARGETS_AT, Target};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return false;
+        };
+        let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
+        else {
+            return false;
+        };
+        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            t.used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+                Some(m) => m.1,
+                None => self.user_value(true, slot, RootType::Table, 0),
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        };
+        let Some((_, frame)) = entry(ResourceType::Srv, SOURCE_AT) else {
+            once!("no plain upscale: the frame's view is not found");
+            return false;
+        };
+        let targets: Vec<Target> = TARGETS_AT
+            .iter()
+            .filter_map(|&at| entry(ResourceType::Uav, at))
+            .filter(|(d, _)| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+            .map(|(d, view)| Target { view, size: [d.Width as u32, d.Height] })
+            .collect();
+        if targets.is_empty() {
+            once!("no plain upscale: none of the pass's images is found");
+            return false;
+        }
+        once!(targets = targets.len(), size = ?targets[0].size, "plain upscale in place of FSR 4's last pass");
+        crate::upscale::instead(list, frame, &targets)
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`
