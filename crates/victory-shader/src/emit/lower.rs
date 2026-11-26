@@ -356,6 +356,10 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With [`exchange_one_meeting`]: the first of the group's per-thread exchange counts (one
+    /// LDS dword per console thread), and this thread's count's dword, made in the entry block.
+    turns: Option<u32>,
+    turn: Option<V>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -923,6 +927,16 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
+fn exchange_one_meeting() -> bool {
+    // `VICTORY_EXCHANGE_ONE=1`: an exchange between the two host waves of a console wave64
+    // program meets once (a group barrier), not twice. Each exchange alternates between two
+    // pairs of exchange dwords by a count each thread keeps in an LDS dword of its own, so the
+    // pair a thread writes next is never one another thread may still be reading: that thread
+    // read it before the meeting this one has passed since.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXCHANGE_ONE").is_some_and(|v| v == "1"))
+}
+
 fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
@@ -1412,6 +1426,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut turns: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1493,7 +1508,15 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                let waves = group.div_ceil(64);
+                                // with one meeting an exchange: two pairs a console wave, and a
+                                // count per thread, while it all stays within 32 KiB of LDS
+                                if group > 32 && exchange_one_meeting() && s.lds_dwords + 4 * waves + group <= 8192 {
+                                    turns = Some(s.lds_dwords + 4 * waves);
+                                    s.lds_dwords += 4 * waves + group;
+                                } else {
+                                    s.lds_dwords += 2 * waves;
+                                }
                             }
                         }
                     }
@@ -1710,6 +1733,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            turns,
+            turn: None,
             halves,
             wave_base: None,
             flat: None,
@@ -4181,6 +4206,9 @@ impl<'a> Lower<'a> {
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
+        if self.turns.is_some() {
+            return self.exchange_halves_once(at, pair, half, mine);
+        }
         let index = self.s.m.bin(at, Bin::Add, pair, half);
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
@@ -4197,8 +4225,53 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
+    /// [`Self::exchange_halves`] with one meeting ([`exchange_one_meeting`]): the thread's own
+    /// count picks which of its console wave's two pairs this exchange uses, and goes up by one.
+    fn exchange_halves_once(&mut self, at: usize, pair: V, half: V, mine: V) -> (V, V) {
+        let lds = self.s.lds();
+        let turn = self.exchange_turn();
+        let count = self.s.m.load(at, turn);
+        let one = self.s.m.i32(1);
+        let next = self.s.m.bin(at, Bin::Add, count, one);
+        self.s.m.store(at, turn, next);
+        // the pair this time: 0 or 2 dwords on
+        let parity = self.s.m.bin(at, Bin::And, count, one);
+        let off = self.s.m.bin(at, Bin::Shl, parity, one);
+        let base = self.s.m.bin(at, Bin::Add, pair, off);
+        let index = self.s.m.bin(at, Bin::Add, base, half);
+        let ptr = self.s.m.element(at, lds, index);
+        self.s.m.store(at, ptr, mine);
+        self.group_sync(at);
+        let k1 = self.s.m.bin(at, Bin::Add, base, one);
+        let p0 = self.s.m.element(at, lds, base);
+        let p1 = self.s.m.element(at, lds, k1);
+        let lo = self.s.m.load(at, p0);
+        let hi = self.s.m.load(at, p1);
+        (lo, hi)
+    }
+
+    /// This thread's exchange count's LDS dword ([`Self::turns`]), made and set to 0 in the
+    /// entry block. Only its own thread reads and writes it, and every thread of a console wave
+    /// runs the same exchanges, so the counts of a console wave agree.
+    fn exchange_turn(&mut self) -> V {
+        if let Some(v) = self.turn {
+            return v;
+        }
+        let e = self.s.entry;
+        let thread = self.console_thread();
+        let base = self.s.m.i32(self.turns.unwrap_or(0));
+        let index = self.s.m.bin(e, Bin::Add, base, thread);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(e, lds, index);
+        let zero = self.s.m.i32(0);
+        self.s.m.store(e, ptr, zero);
+        self.turn = Some(ptr);
+        ptr
+    }
+
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// block): a group of several console waves has a pair for each (two pairs with
+    /// [`exchange_one_meeting`]).
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -4207,8 +4280,9 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
-        let twice = self.s.m.bin(e, Bin::Shl, wave, one);
+        // two dwords a console wave, four with two pairs
+        let shift = self.s.m.i32(if self.turns.is_some() { 2 } else { 1 });
+        let twice = self.s.m.bin(e, Bin::Shl, wave, shift);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
         self.pair = Some(v);
