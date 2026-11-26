@@ -480,22 +480,36 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
+                    REFUSED[0].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             &Job::Wait(fence, value) => {
                 if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                    REFUSED[1].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                if count >= most || lists.1.len() + runs.len() > most_lists {
+                    REFUSED[2].fetch_add(1, Relaxed);
+                    return Err(next);
+                }
+                if !crate::host::joinable(hosts(), &runs) {
+                    REFUSED[3].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Present(..) => {
+                REFUSED[4].fetch_add(1, Relaxed);
+                return Err(next);
+            }
+            Job::Joined(..) | Job::Lists(..) => {
+                REFUSED[5].fetch_add(1, Relaxed);
+                return Err(next);
+            }
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -834,8 +848,18 @@ pub(super) fn present(
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
 }
 
+/// Parts not taken along with the one before ([`Job::take_along`]), by why:
+/// a value not met, a fence not reached, at the most, steps that read what the
+/// one before writes ([`crate::host::joinable`]), a present, other jobs.
+static REFUSED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 /// For the frame-rate line.
 pub(super) fn line(frames: f64) {
+    let r: Vec<f64> = REFUSED.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "parts not joined to the one before, per frame: {:.1} a value not met, {:.1} a fence, {:.1} at the most, {:.1} not joinable (copies, runs or reads of its writes), {:.1} a present, {:.1} other",
+        r[0], r[1], r[2], r[3], r[4], r[5]
+    );
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
     let ms = |i: usize| s[i] / 1000.0 / frames;
     tracing::info!(
