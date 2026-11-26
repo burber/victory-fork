@@ -170,8 +170,8 @@ mod tests {
             // SAFETY: closed lists; the fence and event are the host's, under
             // its lock.
             unsafe {
-                host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
-                host.queue.Signal(&host.fence, *submitted).unwrap();
+                host.lane.execute(&[Some(ahead), Some(behind)]);
+                host.lane.signal(&host.fence, *submitted).unwrap();
                 host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
                 WaitForSingleObject(host.event, INFINITE);
             }

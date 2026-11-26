@@ -82,8 +82,25 @@ pub(super) trait Work: Send {
     {
         Err(next)
     }
+    /// Whether `self`, a submission, writes at the bottom of its pipe what the
+    /// wait `waiting` waits for ([`across`]).
+    fn meets(&self, _waiting: &Self) -> bool {
+        false
+    }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
+}
+
+/// Whether a part of a queue that waits for a value another queue's next part
+/// writes takes that part along first (`VICTORY_JOIN_ACROSS=1`; off by
+/// default). The two queues' parts go to the one host queue in the line's
+/// order anyway; taken together, the writer's lists run first and its write
+/// meets the wait on the card, where each began a submission of its own: 6 of
+/// the 10 parts a frame not joined waited for such values (run 176), each
+/// submission some 1.3 ms of the submitting thread.
+fn across() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_ACROSS").is_some_and(|v| v == "1"))
 }
 
 struct Entry<W> {
@@ -355,8 +372,75 @@ impl<W: Work> Lane<W> {
             match entry.what.take_along(what) {
                 Ok(run) => runs += usize::from(run),
                 Err(what) => {
+                    // The value it waits for is another queue's next part's to
+                    // write: that part first, then this one again.
+                    #[cfg(feature = "diagnostics")]
+                    if what.ask().is_some() {
+                        let state = self.lock();
+                        let mut seen_writer = false;
+                        let mut behind_wait = false;
+                        for (i, e) in state.items.iter().enumerate() {
+                            if e.queue != entry.queue && e.number < limit && e.what.meets(&what) {
+                                seen_writer = true;
+                                behind_wait = state.items.iter().take(i).any(|o| o.queue == e.queue && !o.what.runs());
+                                break;
+                            }
+                        }
+                        WRITER_SEEN[usize::from(seen_writer) + usize::from(seen_writer && behind_wait)].fetch_add(1, Relaxed);
+                    }
+                    // Back where it stood; then, with `VICTORY_JOIN_ACROSS`, the
+                    // other queue's parts up to the one that writes what it waits
+                    // for are taken along in their order (waits of theirs that
+                    // this submission meets among them), and it is tried again.
                     self.lock().items.insert(at, Entry { number, queue, what });
-                    break;
+                    if !across() {
+                        break;
+                    }
+                    let plan = {
+                        let state = self.lock();
+                        let waiting = &state.items[at.min(state.items.len() - 1)].what;
+                        state.items.iter().find(|e| e.queue != entry.queue && e.number < limit && e.what.meets(waiting)).map(|w| {
+                            let q2 = w.queue;
+                            // How many of q2's parts, from its first, up to the writer.
+                            let upto = state.items.iter().filter(|e| e.queue == q2).position(|e| std::ptr::eq(e, w)).unwrap_or(0);
+                            (q2, upto + 1)
+                        })
+                    };
+                    let Some((q2, count)) = plan else {
+                        break;
+                    };
+                    let mut pulled = 0;
+                    while pulled < count {
+                        let taken = {
+                            let mut state = self.lock();
+                            let j = state.items.iter().position(|e| e.queue == q2 && e.number < limit);
+                            j.and_then(|j| Some((j, state.items.remove(j)?)))
+                        };
+                        let Some((j, item)) = taken else {
+                            break;
+                        };
+                        let Entry { number: n2, queue: q, what: w2 } = item;
+                        match entry.what.take_along(w2) {
+                            Ok(run) => {
+                                runs += usize::from(run);
+                                pulled += 1;
+                            }
+                            Err(w2) => {
+                                let mut state = self.lock();
+                                let len = state.items.len();
+                                state.items.insert(j.min(len), Entry { number: n2, queue: q, what: w2 });
+                                break;
+                            }
+                        }
+                    }
+                    if pulled < count {
+                        // The writer is not taken: what is taken goes first, the
+                        // waiting part stays.
+                        break;
+                    }
+                    ACROSS.fetch_add(1, Relaxed);
+                    // The waiting part again, now first of its queue.
+                    continue;
                 }
             }
         }
@@ -481,6 +565,17 @@ impl Work for Job {
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
                     REFUSED[0].fetch_add(1, Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let queue = match self {
+                            Job::Run(q, ..) | Job::Joined(q, ..) => *q,
+                            _ => 0,
+                        };
+                        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+                        if pending.len() < 64 {
+                            pending.push((*wait, queue, Instant::now()));
+                        }
+                    }
                     return Err(next);
                 }
             }
@@ -535,6 +630,16 @@ impl Work for Job {
         Ok(run)
     }
 
+    fn meets(&self, waiting: &Self) -> bool {
+        let Job::Value(wait) = waiting else {
+            return false;
+        };
+        match self {
+            Job::Run(_, lists, _) | Job::Joined(_, lists, ..) => lists.iter().any(|l| crate::host::will_meet(l.host(), wait)),
+            _ => false,
+        }
+    }
+
     fn go(self, forced: bool) {
         let began = Instant::now();
         // Diagnostics: `VICTORY_TIMELINE_SAMPLE_SUBMIT=1` samples this thread
@@ -566,6 +671,8 @@ impl Work for Job {
             Job::Run(queue, lists, order) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
+                written_by(queue, lists.iter().map(|l| l.host()));
+                #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
                 match crate::host::host() {
                     Some(host) => host.execute_late(lists, order),
@@ -575,6 +682,8 @@ impl Work for Job {
             }
             Job::Joined(queue, lists, order, parts, signals) => {
                 let _ = queue;
+                #[cfg(feature = "diagnostics")]
+                written_by(queue, lists.iter().map(|l| l.host()));
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
@@ -857,6 +966,45 @@ pub(super) fn present(
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
 }
 
+/// Diagnostics: at a part refused for a value, the writer of it: not in the
+/// line; in it, behind only submissions of its queue; behind a wait of its
+/// queue.
+#[cfg(feature = "diagnostics")]
+static WRITER_SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Parts of another queue taken along first because they write what a part
+/// waits for ([`across`]).
+static ACROSS: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostics: value waits a part was not taken along for, with the queue of
+/// the part that stood before it, and when.
+#[cfg(feature = "diagnostics")]
+static PENDING: Mutex<Vec<(crate::list::ValueWait, usize, Instant)>> = Mutex::new(Vec::new());
+
+/// Diagnostics: of those, met by a bottom-of-pipe write of a later part of the
+/// line: of the same queue, of another; the microseconds until that part was
+/// done; and those never met so.
+#[cfg(feature = "diagnostics")]
+static PENDING_MET: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Diagnostics: a part of queue `queue` is done; the waits it meets are noted.
+#[cfg(feature = "diagnostics")]
+fn written_by<'a>(queue: usize, lists: impl Iterator<Item = &'a crate::host::HostList> + Clone) {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    pending.retain(|(wait, from, at)| {
+        if at.elapsed() > Duration::from_millis(500) {
+            PENDING_MET[3].fetch_add(1, Relaxed);
+            return false;
+        }
+        if lists.clone().any(|l| crate::host::will_meet(l, wait)) {
+            PENDING_MET[usize::from(*from != queue)].fetch_add(1, Relaxed);
+            PENDING_MET[2].fetch_add(at.elapsed().as_micros() as u64, Relaxed);
+            return false;
+        }
+        true
+    });
+}
+
 /// Parts not taken along with the one before ([`Job::take_along`]), by why:
 /// a value not met, a fence not reached, at the most, steps that read what the
 /// one before writes ([`crate::host::joinable`]), a present, other jobs.
@@ -866,9 +1014,33 @@ static REFUSED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::
 pub(super) fn line(frames: f64) {
     let r: Vec<f64> = REFUSED.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
     tracing::info!(
+        "parts of another queue taken along first for a value they write (VICTORY_JOIN_ACROSS): {:.1} per frame",
+        ACROSS.swap(0, Relaxed) as f64 / frames
+    );
+    #[cfg(feature = "diagnostics")]
+    {
+        let w: Vec<f64> = WRITER_SEEN.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "the writer of a value a part was refused for, per frame: not in the line yet {:.1}, in it behind only submissions of its queue {:.1}, behind a wait of its queue {:.1}",
+            w[0], w[1], w[2]
+        );
+    }
+    tracing::info!(
         "parts not joined to the one before, per frame: {:.1} a value not met, {:.1} a fence, {:.1} at the most, {:.1} not joinable (copies, runs or reads of its writes), {:.1} a present, {:.1} other",
         r[0], r[1], r[2], r[3], r[4], r[5]
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let m: Vec<u64> = PENDING_MET.iter().map(|n| n.swap(0, Relaxed)).collect();
+        let met = (m[0] + m[1]).max(1);
+        tracing::info!(
+            "values not met when a part came, per frame: written later by a part of the same queue {:.1}, of another queue {:.1} ({:.2} ms after, mean), not by a part of the line {:.1}",
+            m[0] as f64 / frames,
+            m[1] as f64 / frames,
+            m[2] as f64 / met as f64 / 1000.0,
+            m[3] as f64 / frames
+        );
+    }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
     let ms = |i: usize| s[i] / 1000.0 / frames;
     tracing::info!(
