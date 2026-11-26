@@ -363,9 +363,19 @@ fn sample() {
     #[repr(C, align(16))]
     struct Aligned(CONTEXT);
     let mut open: Vec<(u32, *mut std::ffi::c_void)> = Vec::new();
+    // `VICTORY_TIMELINE_SAMPLE_ALL=1`: every other thread of the process as
+    // well (looked for again every 400 rounds), each once a millisecond.
+    let all = std::env::var_os("VICTORY_TIMELINE_SAMPLE_ALL").is_some_and(|v| v == "1");
+    let mut others: Vec<u32> = Vec::new();
+    let mut round = 0u64;
     while on() {
-        for place in &TITLES {
-            let id = place.load(Ordering::Relaxed);
+        if all && round % 400 == 0 {
+            others = process_threads();
+        }
+        round += 1;
+        let titles: Vec<u32> = TITLES.iter().map(|p| p.load(Ordering::Relaxed)).collect();
+        let extra = others.iter().copied().filter(|id| all && round % 4 == 0 && !titles.contains(id));
+        for id in titles.iter().copied().chain(extra) {
             if id == 0 {
                 continue;
             }
@@ -422,6 +432,35 @@ fn sample() {
         // SAFETY: opened above.
         unsafe { CloseHandle(handle) };
     }
+}
+
+/// The process's threads but the calling one.
+fn process_threads() -> Vec<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+    let mut ids = Vec::new();
+    // SAFETY: a snapshot of our own; the entry's size is set before use.
+    unsafe {
+        let (pid, me) = (GetCurrentProcessId(), GetCurrentThreadId());
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return ids;
+        }
+        let mut e: THREADENTRY32 = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut more = Thread32First(snap, &mut e) != 0;
+        while more {
+            if e.th32OwnerProcessID == pid && e.th32ThreadID != me {
+                ids.push(e.th32ThreadID);
+            }
+            more = Thread32Next(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    ids
 }
 
 /// `frames` among the stacks: its place, plus one.

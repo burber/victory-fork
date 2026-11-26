@@ -543,8 +543,16 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    // `VICTORY_CARD_WINDOWS_ANYWAY=1`: windows go to the card while the card's
+    // budget is not past its end, not only while a fifth of it is free. They
+    // are few and small (two of 12 MB in the first rooms of Series S), and
+    // what a shader reads from a window in the PC's memory crosses the bus on
+    // every read: the title's FSR 4 passes read their weights from one, about
+    // 200 loads a thread at 1080p, some 110 ms of the card a frame on an RTX
+    // 4070 Ti. The textures make room for them as for any copy. Off by default.
+    let anyway = std::env::var_os("VICTORY_CARD_WINDOWS_ANYWAY").is_some_and(|v| v == "1");
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > if anyway { budget } else { budget / 10 * 8 }
     {
         return None;
     }
@@ -1489,8 +1497,14 @@ fn spin(there: impl Fn() -> bool) {
 }
 
 /// How many threads are kept for [`wide`].
+/// `VICTORY_WIDE_THREADS=<n>` sets it (1 to 16); a quarter of the processors
+/// otherwise, 2 to 6.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    std::env::var("VICTORY_WIDE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 16))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
 }
 
 fn workers() -> &'static Workers {
