@@ -6869,6 +6869,24 @@ impl HostList {
         if known.is_some() {
             return known;
         }
+        // `VICTORY_FILL_ON_CARD=1` (with `VICTORY_CARD_STEPS=2`): the fill
+        // goes into a buffer the card can write, so that the steps on the
+        // card bring its bytes where the CPU would have to wait for the
+        // flights writing them first (a root constant buffer that is not
+        // 256-byte aligned in a 174 MB title buffer that shaders declare
+        // written: about 98 ms a frame of the submitting thread on an RTX
+        // 4070 Ti in Series S). Off by default.
+        if fill_on_card()
+            && card_steps::stage() > 1
+            && let Some(host) = host()
+            && let Some((buffer, data)) = self.upload(host, len)
+        {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.defer_fill_buffer(&buffer, data, src, len as usize);
+            self.deferred().filled.insert(key, gpu);
+            return Some(gpu);
+        }
         let (gpu, to) = self.scratch(len)?;
         self.defer_fill(to, src, len as usize);
         self.deferred().filled.insert(key, gpu);
@@ -10678,3 +10696,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+
+/// Whether [`HostList::fill_scratch`] gives its fills a buffer the card can
+/// write (`VICTORY_FILL_ON_CARD=1`, off by default).
+pub(crate) fn fill_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_ON_CARD").is_some_and(|v| v == "1"))
+}
