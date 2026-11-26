@@ -316,6 +316,25 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
     }
 }
 
+/// The header's second word for a block in a write-watched reservation of
+/// its own (no alignment is this); its first is then the user address's
+/// offset from the reservation's base.
+const WATCHED: usize = usize::MAX;
+
+/// Blocks of [`XMemAllocDefault`] of this many bytes and more get a
+/// write-watched reservation of their own (`VICTORY_XMEM_WATCHED_KB`, 1024
+/// unless set; 0 turns it off).
+fn watched_alloc_from() -> usize {
+    static FROM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FROM.get_or_init(|| {
+        match std::env::var("VICTORY_XMEM_WATCHED_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            Some(0) => usize::MAX,
+            Some(kb) => kb << 10,
+            None => MIB,
+        }
+    })
+}
+
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
@@ -330,6 +349,27 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    // A big block in a reservation of its own, write-watched: the GPU side
+    // copies only the pages written since its last copy of it. From the host
+    // heap, a 20 MB buffer the title keeps there was copied whole twice a
+    // frame (40 MB, ~5 ms of the preparing thread's work a frame).
+    if size >= watched_alloc_from() && layout.align() <= 64 << 10 {
+        let total = layout.size();
+        // SAFETY: a fresh reservation of our own.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), total, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        }
+        .cast::<u8>();
+        if !base.is_null() {
+            // SAFETY: the reservation holds the alignment (at least the
+            // header) and then `size` bytes; it is 64 KiB aligned.
+            unsafe {
+                let user = base.add(layout.align());
+                user.sub(HEADER).cast::<[usize; 2]>().write([layout.align(), WATCHED]);
+                return user.cast();
+            }
+        }
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -365,6 +405,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align == WATCHED {
+            // `size` is the offset from the reservation's base.
+            VirtualFree(user.sub(size).cast(), 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -1930,6 +1975,20 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+        // Big blocks: a write-watched reservation of their own.
+        for (field, align) in [(0, 16), (0x10, 64 * 1024)] {
+            let attributes = field << ALIGNMENT_SHIFT | 1 << 29;
+            let p = XMemAlloc(3 << 20, attributes);
+            assert!(!p.is_null());
+            assert_eq!(p as usize % align, 0);
+            // SAFETY: 3 MiB were allocated.
+            unsafe { p.cast::<u8>().write_bytes(0xcd, 3 << 20) };
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: a plain query of our own memory.
+            unsafe { VirtualQueryEx(GetCurrentProcess(), p, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+            assert_eq!(info.AllocationBase as usize % (64 << 10), 0);
+            XMemFree(p, attributes);
+        }
     }
 
     #[test]
