@@ -112,6 +112,18 @@ fn air() -> f32 {
     })
 }
 
+/// How much of the estimate's colour is taken out, 0 to 1
+/// (`VICTORY_AMBIENT_GREY`; 0 unless set): its brightness stays, its hue goes
+/// toward a neutral white. The estimate is the mean of what is on screen, so
+/// a room of green walls lit everything in it green.
+fn grey() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_GREY").unwrap_or_default();
+        set.trim().parse::<f32>().ok().filter(|v| v.is_finite()).map_or(0.0, |v| v.clamp(0.0, 1.0))
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -137,7 +149,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float grey;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -320,6 +332,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // Its colour taken out as asked (`grey`), its brightness kept.
+    found = lerp(found, dot(found, LUMA) * float3(1.0, 0.98, 0.94), grey);
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -461,6 +475,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = grey().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
