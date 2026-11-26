@@ -537,6 +537,15 @@ impl Work for Job {
 
     fn go(self, forced: bool) {
         let began = Instant::now();
+        // Diagnostics: `VICTORY_TIMELINE_SAMPLE_SUBMIT=1` samples this thread
+        // as often as the title's submitting threads.
+        #[cfg(feature = "diagnostics")]
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var_os("VICTORY_TIMELINE_SAMPLE_SUBMIT").is_some_and(|v| v == "1")) {
+                crate::timeline::title_thread();
+            }
+        }
         let _doing = crate::timeline::span(match self {
             Job::Run(..) => "the line: a submission",
             Job::Joined(..) => "the line: submissions joined",

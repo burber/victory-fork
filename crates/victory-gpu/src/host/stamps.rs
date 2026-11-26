@@ -84,10 +84,10 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
     let (mut card, mut pc) = (0, 0);
     // SAFETY: plain queries; the mapping holds twice `MOST` tick counts.
     let (frequency, back) = unsafe {
-        if host.queue.GetClockCalibration(&mut card, &mut pc).is_err() {
+        if host.lane.unordered().GetClockCalibration(&mut card, &mut pc).is_err() {
             return Vec::new();
         }
-        let frequency = host.queue.GetTimestampFrequency().unwrap_or(0);
+        let frequency = host.lane.unordered().GetTimestampFrequency().unwrap_or(0);
         (frequency, std::slice::from_raw_parts(stamps.back as *const u64, 2 * MOST))
     };
     if frequency == 0 {
@@ -137,7 +137,7 @@ impl Host {
                 lists.push(list.cast()?);
             }
             let (mut card, mut pc) = (0, 0);
-            self.queue.GetClockCalibration(&mut card, &mut pc)?;
+            self.lane.unordered().GetClockCalibration(&mut card, &mut pc)?;
             Ok(Stamps {
                 lists,
                 back: back as usize,

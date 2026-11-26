@@ -332,7 +332,7 @@ pub(crate) fn polled(at: usize, value: u64) {
 }
 
 /// Threads of the title's that submit or present.
-static TITLES: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static TITLES: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
 
 /// This thread is one of the title's that submit: what it does is sampled.
 #[inline(always)]
