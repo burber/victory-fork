@@ -708,7 +708,15 @@ pub(super) fn chrome(
             )?,
             Kind::Sample => {
                 let stack = (e.stack as usize).checked_sub(1).and_then(|s| stacks.get(s)).map_or(&[][..], |s| &s[..]);
-                let stack: Vec<String> = stack.iter().take_while(|a| **a != 0).map(|a| format!("{a:#x}")).collect();
+                // Each word by the name of what it points into, where known
+                // (`VICTORY_TIMELINE_STACK_NAMES=1`), else as a number.
+                static NAMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let named = *NAMED.get_or_init(|| std::env::var_os("VICTORY_TIMELINE_STACK_NAMES").is_some_and(|v| v == "1"));
+                let stack: Vec<String> = stack
+                    .iter()
+                    .take_while(|a| **a != 0)
+                    .map(|a| if named { escaped(&names.of(*a)).replace(' ', "_") } else { format!("{a:#x}") })
+                    .collect();
                 write!(
                     out,
                     ",\n{{\"ph\":\"i\",\"s\":\"t\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"cat\":\"sample\",\"name\":\"{}\",\"args\":{{\"at\":\"{:#x}\",\"stack\":\"{}\"}}}}",
