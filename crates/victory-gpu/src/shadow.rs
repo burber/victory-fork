@@ -681,6 +681,99 @@ fn land_tally(copy: &Shadow, put: u64) {
     }
 }
 
+/// `VICTORY_NARROW_WRITES=1`: for copies whose shader writes are not landed
+/// ([`back_card_skips`]), shader writes are declared only over the pieces
+/// the card's compare found changed lately ([`narrow_learn`]), not over the
+/// whole range a view names; every [`NARROW_RELEARN`]th frame the whole is
+/// declared again, so that pieces shaders begin to write are found.
+///
+/// Why: the skinning passes write through one view of the whole 174 MB
+/// constants heap, 11 times a frame, while what they change is a few
+/// hundred KB a frame. Every title write into the heap's ring then fell
+/// under flights' writes: put in run by run (2.6 ms a frame), fills waited
+/// for or planned on the card (2.5 + 3.5 ms).
+///
+/// What it risks: a piece shaders begin to write between relearn frames is
+/// not under their declared writes; the title's bytes there go up whole,
+/// as for any other, and may overwrite what a shader wrote there until the
+/// next relearn frame.
+pub(crate) fn narrow_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NARROW_WRITES").is_some_and(|v| v == "1"))
+}
+
+/// Every this many frames the whole range is declared ([`narrow_on`]).
+const NARROW_RELEARN: u64 = 16;
+
+/// Pieces found changed by copy: offset -> (end, frame last found).
+static NARROW: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, BTreeMap<usize, (usize, u64)>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Since the line: declarations narrowed, whole, and their bytes before
+/// and after.
+pub(crate) static NARROW_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The card's compare found `[lo, hi)` (offsets in the copy) changed.
+pub(crate) fn narrow_learn(copy: &Shadow, lo: usize, hi: usize) {
+    let frame = crate::frame::current();
+    let mut n = NARROW.lock().unwrap_or_else(|e| e.into_inner());
+    n.entry(copy.id()).or_default().insert(lo, (hi, frame));
+}
+
+/// Shader writes declared over title memory `[address, address + len)` of
+/// `copy`: the ranges to declare instead, or `None` for the whole.
+pub(crate) fn narrowed(copy: &Shadow, address: usize, len: usize) -> Option<Vec<(usize, usize)>> {
+    if !narrow_on() || !back_card_skips(copy) {
+        return None;
+    }
+    let frame = crate::frame::current();
+    let whole = || {
+        NARROW_STATS[1].fetch_add(1, Ordering::Relaxed);
+        None
+    };
+    if frame % NARROW_RELEARN == 0 {
+        return whole();
+    }
+    let start = copy.start as usize;
+    let (from, to) = (address.saturating_sub(start), address + len - start);
+    let n = NARROW.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(learned) = n.get(&copy.id()) else {
+        return whole();
+    };
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    // Pieces found in the last 4 relearns.
+    for (&lo, &(hi, seen)) in learned.range(..to) {
+        if hi <= from || frame > seen + 4 * NARROW_RELEARN {
+            continue;
+        }
+        let (a, b) = (start + lo.max(from), start + hi.min(to));
+        match out.last_mut() {
+            Some(last) if last.1 >= a => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    NARROW_STATS[0].fetch_add(1, Ordering::Relaxed);
+    NARROW_STATS[2].fetch_add(len as u64, Ordering::Relaxed);
+    NARROW_STATS[3].fetch_add(out.iter().map(|r| (r.1 - r.0) as u64).sum::<u64>(), Ordering::Relaxed);
+    Some(out)
+}
+
+/// For the log, every ten seconds.
+pub(crate) fn narrow_say() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if !narrow_on() || now < LAST.load(Ordering::Relaxed) + 10_000 {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let s: Vec<u64> = NARROW_STATS.iter().map(|x| x.swap(0, Ordering::Relaxed)).collect();
+    let pieces: usize = NARROW.lock().unwrap_or_else(|e| e.into_inner()).values().map(|m| m.len()).sum();
+    tracing::info!(
+        "shader writes declared narrowed (VICTORY_NARROW_WRITES), 10 s: {} narrowed ({:.0} MB -> {:.1} MB), {} whole; {} pieces known",
+        s[0], s[2] as f64 / 1048576.0, s[3] as f64 / 1048576.0, s[1], pieces
+    );
+}
+
 /// [`Shadow::alone`]'s answers: by copy, the frame asked and the answer.
 static ALONE: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, (u64, bool)>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));

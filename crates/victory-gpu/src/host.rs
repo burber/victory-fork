@@ -4618,6 +4618,17 @@ impl Host {
             let mut seen = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
+                if crate::shadow::narrow_on() {
+                    for r in plan.ranges.iter().filter(|r| !r.picked && r.compared && crate::shadow::back_card_skips(&r.shadow)) {
+                        for p in 0..r.span.pieces {
+                            if differs.get((r.at + p) as usize).is_some_and(|&d| torn::flagged(d)) {
+                                let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                                crate::shadow::narrow_learn(&r.shadow, lo, hi);
+                            }
+                        }
+                    }
+                    crate::shadow::narrow_say();
+                }
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
@@ -6937,10 +6948,13 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        let ranges = crate::shadow::narrowed(shadow, address, len).unwrap_or_else(|| vec![(address, address + len)]);
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.gpu_written.insert(key) || !declare_once() {
-            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        for (a, b) in ranges {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, a, b - a);
+            if deferred.gpu_written.insert(key) || !declare_once() {
+                deferred.copies.push(Step::GpuWrite(shadow.clone(), a, b - a));
+            }
         }
     }
 
