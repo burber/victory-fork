@@ -329,7 +329,55 @@ static CSTATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 fn constants_wanted(start: u64, len: u64, min: u64) -> bool {
     len >= min.max(1)
         && start.checked_add(len).is_some_and(|end| end <= LOW)
-        && matches!(cover(start as usize, len as usize), Cover::Run(..))
+        && match cover(start as usize, len as usize) {
+            Cover::Run(..) => true,
+            // Pieces of sections side by side: stitched in a view of ours
+            // (`VICTORY_INPLACE_STITCH`, on).
+            Cover::Scattered => stitch_on() && pieces(start as usize, len as usize).is_some(),
+            _ => false,
+        }
+}
+
+/// `VICTORY_INPLACE_STITCH=0`: the constants heap is taken only if it is
+/// one run of a section, as in fxceless' runtime. On (the default): also
+/// when the title's views of it show pieces of sections in another order
+/// (ours, the 182 MB heap at Series S: three views of one section, the
+/// first piece from further on in it), which a view of ours shows side by
+/// side in the title's order ([`constants_open`]).
+fn stitch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_STITCH").is_none_or(|v| v != "0"))
+}
+
+/// The pieces of sections the title's views show at `[at, at + len)`, in
+/// address order: (section, offset, bytes), each 64 KiB aligned, joined
+/// where one follows on from the one before. `None` if there is a hole or
+/// a piece is not 64 KiB aligned.
+fn pieces(at: usize, len: usize) -> Option<Vec<(usize, u64, usize)>> {
+    let v = views();
+    let end = at + len;
+    let mut out: Vec<(usize, u64, usize)> = Vec::new();
+    let mut reached = at;
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back().filter(|(b, view)| **b + view.0 > at)?;
+    let mut next = Some((base, bytes, section, offset));
+    while let Some((base, bytes, section, offset)) = next {
+        let skip = reached - base;
+        let take = (base + bytes).min(end) - reached;
+        let off = offset + skip as u64;
+        if !off.is_multiple_of(K64 as u64) || !take.is_multiple_of(K64) {
+            return None;
+        }
+        match out.last_mut() {
+            Some(last) if last.0 == section && last.1 + last.2 as u64 == off => last.2 += take,
+            _ => out.push((section, off, take)),
+        }
+        reached += take;
+        if reached >= end {
+            return Some(out);
+        }
+        next = v.views.get(&reached).map(|&(b, s, o)| (reached, b, s, o));
+    }
+    None
 }
 
 /// The 64 KiB pages `[at, end)` that hold `[start, start + len)`.
@@ -374,6 +422,20 @@ fn constants_place(device: &ID3D12Device, start: u64, len: u64, min: u64, fresh:
         Some(i) => i,
         None => {
             if !constants_wanted(at, end - at, min) {
+                // Why a big one is not taken, the first few times.
+                if end - at >= min.max(1) {
+                    static SAID: AtomicU64 = AtomicU64::new(0);
+                    if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+                        tracing::info!(
+                            start = format_args!("{at:#x}"),
+                            bytes = end - at,
+                            below_4g = end <= LOW,
+                            cover = ?cover(at as usize, (end - at) as usize),
+                            views = %views_summary(at as usize, (end - at) as usize),
+                            "a big title buffer not taken for the constants heap (VICTORY_INPLACE_CONSTANTS)"
+                        );
+                    }
+                }
                 return Ok(None);
             }
             if !fresh {
@@ -411,6 +473,12 @@ fn constants_place(device: &ID3D12Device, start: u64, len: u64, min: u64, fresh:
 fn constants_open(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
     let bytes = (end - at) as usize;
     let Cover::Run(section, offset) = cover(at as usize, bytes) else {
+        if stitch_on()
+            && cover(at as usize, bytes) == Cover::Scattered
+            && let Some(pieces) = pieces(at as usize, bytes)
+        {
+            return constants_stitch(device, at, end, &pieces);
+        }
         return Err((3, format!("not one run of a section: {:?}", cover(at as usize, bytes))));
     };
     if !offset.is_multiple_of(K64 as u64) {
@@ -444,6 +512,97 @@ fn constants_open(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (u
         }
     }
 }
+
+/// [`constants_open`] for title memory whose views show `pieces` of
+/// sections (section, offset, bytes; in address order): one placeholder
+/// of ours as long as all of them, each piece mapped into its part of it in
+/// the title's order, so that our address `x` shows what the title sees at
+/// `at + x`; then the heap is opened over the whole of it.
+///
+/// Whether the host takes a heap over more than one view is the card
+/// driver's to say: refused, everything of ours goes again and the buffer
+/// is a copy as before.
+fn constants_stitch(device: &ID3D12Device, at: u64, end: u64, pieces: &[(usize, u64, usize)]) -> Result<Region, (usize, String)> {
+    let bytes = (end - at) as usize;
+    // SAFETY (the whole function): a placeholder of our own, split and
+    // filled with views of sections the title has views of (the runtime
+    // keeps their handles while views of them are mapped).
+    unsafe {
+        let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+        let hole = mem::VirtualAlloc2(process, std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0)
+            .cast::<u8>();
+        if hole.is_null() {
+            return Err((4, format!("no placeholder of ours: {}", std::io::Error::last_os_error())));
+        }
+        let mut mapped: Vec<mem::MEMORY_MAPPED_VIEW_ADDRESS> = Vec::new();
+        let undo = |mapped: &[mem::MEMORY_MAPPED_VIEW_ADDRESS], parts: &[(usize, usize)]| {
+            for &view in mapped {
+                mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER);
+            }
+            for &(at, _) in parts {
+                mem::VirtualFree(hole.add(at).cast(), 0, mem::MEM_RELEASE);
+            }
+        };
+        // The placeholder split into one part per piece.
+        let mut parts: Vec<(usize, usize)> = Vec::new();
+        let mut x = 0usize;
+        for &(_, _, n) in pieces {
+            parts.push((x, n));
+            x += n;
+        }
+        for &(x, n) in &parts[..parts.len() - 1] {
+            if mem::VirtualFree(hole.add(x).cast(), n, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER) == 0 {
+                let error = std::io::Error::last_os_error();
+                // Parts split so far, and the rest: released one by one.
+                let done: Vec<(usize, usize)> = parts.iter().copied().take_while(|p| p.0 <= x).collect();
+                undo(&[], &done);
+                return Err((4, format!("the placeholder not split: {error}")));
+            }
+        }
+        for (&(section, offset, n), &(x, _)) in pieces.iter().zip(&parts) {
+            let view = mem::MapViewOfFile3(
+                section as SysHandle,
+                process,
+                hole.add(x).cast(),
+                offset,
+                n,
+                mem::MEM_REPLACE_PLACEHOLDER,
+                mem::PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            if view.Value.is_null() {
+                let error = std::io::Error::last_os_error();
+                undo(&mapped, &parts);
+                return Err((4, format!("a piece not mapped in the view of ours: {error}")));
+            }
+            mapped.push(view);
+            if mem::VirtualAlloc(view.Value, n, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+                let error = std::io::Error::last_os_error();
+                undo(&mapped, &parts);
+                return Err((4, format!("a piece of the view of ours not committed: {error}")));
+            }
+        }
+        match open(device, From::Part(hole as usize, bytes)) {
+            Ok(heap) => {
+                tracing::info!(
+                    start = format_args!("{at:#x}"),
+                    bytes,
+                    pieces = pieces.len(),
+                    "the constants heap stitched: its pieces side by side in a view of ours, opened as one heap (VICTORY_INPLACE_STITCH)"
+                );
+                Ok(Region { start: at, end, heap })
+            }
+            Err(e) => {
+                undo(&mapped, &parts);
+                Err((5, format!("refused by the host over {} pieces: {e}", pieces.len())))
+            }
+        }
+    }
+}
+
+/// A section handle as `windows-sys` takes it.
+type SysHandle = windows_sys::Win32::Foundation::HANDLE;
 
 /// The title maps other pages at `[at, at + len)`: the regions over it are
 /// forgotten (what is placed in them is let go by [`title_memory_freeing`]).
@@ -796,6 +955,37 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
         reached += bytes;
     }
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
+}
+
+/// For the log: how the title's views make up `[at, at + len)`: views,
+/// sections, breaks in the run (a view not following on from the one
+/// before it in its section), holes, and the first few views.
+fn views_summary(at: usize, len: usize) -> String {
+    let v = views();
+    let end = at + len;
+    let (mut n, mut breaks, mut holes) = (0usize, 0usize, 0usize);
+    let mut sections = std::collections::BTreeSet::new();
+    let mut last: Option<(usize, usize, u64)> = None; // end address, section, end offset
+    let mut first = Vec::new();
+    for (&base, &(bytes, section, offset)) in v.views.range(..end) {
+        if base + bytes <= at {
+            continue;
+        }
+        n += 1;
+        sections.insert(section);
+        if let Some((e, s, o)) = last {
+            if e != base {
+                holes += 1;
+            } else if s != section || o != offset {
+                breaks += 1;
+            }
+        }
+        if first.len() < 6 {
+            first.push(format!("{base:#x}+{bytes:#x}@{section:#x}:{offset:#x}"));
+        }
+        last = Some((base + bytes, section, offset + bytes as u64));
+    }
+    format!("{n} views, {} sections, {breaks} breaks, {holes} holes; first {}", sections.len(), first.join(" "))
 }
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.

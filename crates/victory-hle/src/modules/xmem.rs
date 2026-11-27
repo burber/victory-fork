@@ -800,6 +800,10 @@ impl View {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
+        // Committed for one view is for all ([`rebind_fresh`] asks).
+        for p in slice.index..(slice.index + n).min(slice.section.pages) {
+            slice.section.committed[p / 64].fetch_or(1 << (p % 64), std::sync::atomic::Ordering::AcqRel);
+        }
         Some(view)
     }
 
@@ -1149,6 +1153,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     let Some(pages) = pages else {
         return address;
     };
+    if rebind_min() > 0 && n * PAGE >= 8 << 20 {
+        tracing::info!(address = format_args!("{base:#x}"), n, "a big XMemMapPhysicalPages (VICTORY_XMEM_REBIND_MB)");
+    }
+    rebind_fresh(base, &pages);
     let slices: Vec<Option<Slice>> = {
         let table = page_table();
         pages.iter().map(|page| table.pages.get(page).cloned()).collect()
@@ -1177,6 +1185,142 @@ pub extern "system" fn XMemMapPhysicalPages(
     address
 }
 
+/// The fewest bytes a call of [`XMemMapPhysicalPages`] maps for its pages
+/// to be bound afresh ([`rebind_fresh`]): `VICTORY_XMEM_REBIND_MB`, 16; 0
+/// off. Off unless `VICTORY_INPLACE_CONSTANTS=1` when not set.
+fn rebind_min() -> usize {
+    static MIN: LazyLock<usize> = LazyLock::new(|| match std::env::var("VICTORY_XMEM_REBIND_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(mb) => mb << 20,
+        None if std::env::var_os("VICTORY_INPLACE_CONSTANTS").is_some_and(|v| v == "1") => 16 << 20,
+        None => 0,
+    });
+    *MIN
+}
+
+/// The title's graphics memory for 32-bit addresses ends here.
+const LOW_END: usize = 1 << 32;
+
+/// A section as long as the low 4 GiB, made reserved (nothing committed,
+/// nothing taken from the PC until a page of it is), whose page `k` backs
+/// address `k * PAGE` ([`rebind_fresh`]); and which of its pages are
+/// bound to a title page already.
+struct ByAddress {
+    section: Arc<Section>,
+    used: Mutex<Vec<u64>>,
+}
+
+fn by_address() -> Option<&'static ByAddress> {
+    static IT: LazyLock<Option<ByAddress>> = LazyLock::new(|| {
+        let n = LOW_END / PAGE;
+        // SAFETY: plain section creation, as `XMemAllocatePhysicalPages`.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (LOW_END as u64 >> 32) as u32,
+                LOW_END as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            tracing::warn!(error = %std::io::Error::last_os_error(), "no section by address (VICTORY_XMEM_REBIND_MB)");
+            return None;
+        }
+        victory_gpu::title_memory_section(handle as usize, LOW_END as u64, on_wine());
+        Some(ByAddress {
+            section: Arc::new(Section {
+                handle,
+                pages: n,
+                window: std::sync::OnceLock::new(),
+                committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            }),
+            used: Mutex::new(vec![0; n.div_ceil(64)]),
+        })
+    });
+    IT.as_ref()
+}
+
+/// Before a big mapping call at `base` below 4 GiB: if none of `pages`
+/// was ever mapped or written (no page of theirs committed in its
+/// section), none is there twice, and the pages of the section by address
+/// ([`by_address`]) for `[base, base + n pages)` are not bound yet, the
+/// title's pages are bound to those. Page numbers are ours to give and a
+/// page never committed holds zeros wherever it lives, so the title sees
+/// nothing change; what changes is that title memory mapped with fresh
+/// pages is, whatever the order of its calls, one run of one section.
+///
+/// Why: the title's 182 MB constants heap (0x37200000 in one run) is
+/// mapped in three calls (27, 47 and 100 MB), each a run of its 6.1 GiB
+/// pool, the calls in another order than their addresses: three views of
+/// the pool that do not follow on. The host opens a heap on one view only
+/// (`OpenExistingHeapFromAddress1` over two: E_INVALIDARG), so the heap
+/// could not be in place (`victory_gpu`, `VICTORY_INPLACE_CONSTANTS`).
+///
+/// shortcut: a page of the section by address, once bound, stays bound
+/// (its address is not given to another title page again).
+fn rebind_fresh(base: usize, pages: &[usize]) {
+    let min = rebind_min();
+    let n = pages.len();
+    if min == 0 || n * PAGE < min || !base.is_multiple_of(PAGE) || base + n * PAGE > LOW_END {
+        return;
+    }
+    let Some(by) = by_address() else {
+        return;
+    };
+    let mut table = page_table_mut();
+    let mut seen = std::collections::HashSet::with_capacity(n);
+    let (mut unknown, mut committed, mut twice) = (0usize, 0usize, 0usize);
+    for page in pages {
+        let Some(slice) = table.pages.get(page) else {
+            unknown += 1;
+            continue;
+        };
+        committed += usize::from(slice.section.committed[slice.index / 64].load(Ordering::Acquire) >> (slice.index % 64) & 1 != 0);
+        twice += usize::from(!seen.insert(*page));
+    }
+    let first = base / PAGE;
+    let mut used = by.used.lock().unwrap_or_else(|e| e.into_inner());
+    let taken = (first..first + n).filter(|&k| used[k / 64] >> (k % 64) & 1 != 0).count();
+    if unknown + committed + twice + taken > 0 {
+        tracing::info!(
+            address = format_args!("{base:#x}"),
+            n,
+            unknown,
+            committed,
+            twice,
+            taken,
+            "a big mapping's pages not bound afresh (VICTORY_XMEM_REBIND_MB)"
+        );
+        return;
+    }
+    for k in first..first + n {
+        used[k / 64] |= 1 << (k % 64);
+    }
+    drop(used);
+    let old: Vec<Slice> = pages
+        .iter()
+        .enumerate()
+        .filter_map(|(k, page)| {
+            table.pages.insert(
+                *page,
+                Slice {
+                    section: by.section.clone(),
+                    index: first + k,
+                },
+            )
+        })
+        .collect();
+    drop(table);
+    tracing::info!(
+        address = format_args!("{base:#x}"),
+        n,
+        "a big mapping's fresh pages bound to the section by address (VICTORY_XMEM_REBIND_MB)"
+    );
+    // The old slices go without the lock (a section's last one unmaps its window).
+    drop(old);
+}
+
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (the title passes 0 for addresses to clear).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
@@ -1188,6 +1332,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         return 0;
     }
     lift_thread();
+    if rebind_min() > 0 && n * PAGE >= rebind_min() {
+        tracing::info!(n, "a big XMemMapPhysicalPagesScatter (not bound afresh: scatter)");
+    }
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
         let wanted: Vec<(usize, usize)> = (0..n)
