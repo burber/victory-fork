@@ -294,7 +294,87 @@ impl Drop for SyncedHeaps {
 /// null, or went on showing what they showed before.
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
+/// Diagnostics: where the title's code writes into shader heaps
+/// (`VICTORY_HEAP_WRITERS=1`): the faulting instruction of each guarded
+/// write, counted, logged every ten seconds by [`heap_writers_say`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn heap_writers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WRITERS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+static HEAP_WRITERS: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+
+/// A write fault at `at` by the instruction at `rip`: counted if `at` is in
+/// a shader heap. From the fault handler: never waits for a lock.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn heap_write_fault(at: usize, rip: usize) {
+    let Ok(heaps) = SHADER_HEAPS.try_read() else {
+        return;
+    };
+    if !heaps.iter().any(|&(start, end, _)| (start as usize) <= at && at < end as usize) {
+        return;
+    }
+    drop(heaps);
+    if let Ok(mut w) = HEAP_WRITERS.try_lock() {
+        *w.get_or_insert_with(Default::default).entry(rip).or_default() += 1;
+    }
+}
+
+/// For the log: the module an instruction is in and its offset there (the
+/// mapping's base and the offset if no module is named for it: the title's
+/// image, mapped by our loader).
+#[cfg(feature = "diagnostics")]
+fn where_is(rip: usize) -> String {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW,
+    };
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: queries about an address; the buffers are ours.
+    unsafe {
+        let mut module = std::ptr::null_mut();
+        if GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            rip as *const u16,
+            &mut module,
+        ) != 0
+        {
+            let mut name = [0u16; 260];
+            let n = GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) as usize;
+            let name = String::from_utf16_lossy(&name[..n]);
+            let short = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_owned();
+            return format!("{short}+{:#x}", rip - module as usize);
+        }
+        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(rip as *const _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0 {
+            return format!("image@{:#x}+{:#x}", info.AllocationBase as usize, rip - info.AllocationBase as usize);
+        }
+        format!("{rip:#x}")
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn heap_writers_say() {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if now < LAST.load(std::sync::atomic::Ordering::Relaxed) + 10_000 {
+        return;
+    }
+    LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    let all: Vec<(usize, u64)> = HEAP_WRITERS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default().into_iter().collect();
+    let mut all = all;
+    all.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let total: u64 = all.iter().map(|x| x.1).sum();
+    let top: Vec<String> = all.iter().take(24).map(|(rip, n)| format!("{}:{n}", where_is(*rip))).collect();
+    tracing::info!("write faults in shader heaps, 10 s: {total} at {} sites; most: {}", all.len(), top.join(" "));
+}
+
 pub(crate) fn sync_heaps() {
+    #[cfg(feature = "diagnostics")]
+    if heap_writers_on() {
+        heap_writers_say();
+    }
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return;

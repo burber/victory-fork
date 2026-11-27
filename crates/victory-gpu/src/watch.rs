@@ -2610,6 +2610,10 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        #[cfg(feature = "diagnostics")]
+        if ours.is_none() && crate::descriptor::heap_writers_on() {
+            crate::descriptor::heap_write_fault(at, r.ExceptionAddress as usize);
+        }
         if ours.is_none()
             && PROTECTED.any(block, block + 1)
             // SAFETY: the context the system passes, to go on from.
