@@ -1239,9 +1239,15 @@ struct Hosted {
 #[cfg(windows)]
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
-    })
+    if let Some(&on) = ON.get() {
+        return on;
+    }
+    let on = std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted();
+    // Not kept before the device is made: `tiles::wanted` has no answer yet.
+    if crate::host::host().is_none() {
+        return on;
+    }
+    *ON.get_or_init(|| on)
 }
 
 /// The first level a placed texture's view shows: of views of one 2D
@@ -1551,6 +1557,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
+        crate::tiles::GATE[0].fetch_add(u64::from(shape_fits), Relaxed);
+        crate::tiles::GATE[1].fetch_add(u64::from(shape_fits && r.host.placed.load(Relaxed)), Relaxed);
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
@@ -1562,7 +1570,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
+            crate::tiles::GATE[2].fetch_add(u64::from(readable), Relaxed);
+            crate::tiles::GATE[3].fetch_add(u64::from(partly), Relaxed);
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            crate::tiles::GATE[4].fetch_add(u64::from(reserved.is_some()), Relaxed);
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -2480,8 +2491,12 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Not when a reserved texture is asked for: one cut from
+    // a block has memory and no tiles, and levels on demand found every
+    // one it asked for so (`GetResourceTiling` all zeros, run 252), so no
+    // texture was ever made level by level.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())

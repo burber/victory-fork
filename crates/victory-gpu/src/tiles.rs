@@ -71,16 +71,32 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
+/// Host copies made since the start that got past each test of the way in
+/// (`resource.rs`): the shape fits; and placed; readable; not all held
+/// (partly); a reserved texture made.
+pub(crate) static GATE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&on) = ON.get() {
+        return on;
+    }
+    if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        return *ON.get_or_init(|| false);
+    }
+    // Asked before the device is made (`resource::held_only` is): no answer
+    // is kept then. Kept, a "no" from that moment turned the switch off for
+    // the whole run, and every host copy took every level's memory (run 249:
+    // 3.7 of 5.0 GB in levels the title does not hold; the card full, faces
+    // baked from stand-ins).
+    if host().is_none() {
+        return false;
+    }
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
-            return false;
-        }
         let Some(host) = host() else {
             return false;
         };
@@ -300,7 +316,29 @@ impl Tiled {
             );
         }
         let standard_levels = u32::from(packed.NumStandardMips);
+        let say = |why: &str| {
+            static SAID: AtomicU32 = AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 12 {
+                // SAFETY: a live texture.
+                let d = unsafe { texture.GetDesc() };
+                tracing::warn!(
+                    why,
+                    total,
+                    standard = packed.NumStandardMips,
+                    packed_mips = packed.NumPackedMips,
+                    packed_tiles = packed.NumTilesForPackedMips,
+                    count,
+                    levels,
+                    format = d.Format.0,
+                    width = d.Width,
+                    height = d.Height,
+                    mips = d.MipLevels,
+                    "a texture not cut into tiles for levels on demand"
+                );
+            }
+        };
         if total == 0 || standard_levels + u32::from(packed.NumPackedMips) != levels || standard_levels > count {
+            say("tiling counts");
             return None;
         }
         let mut standard = Vec::with_capacity(standard_levels as usize);
@@ -311,12 +349,14 @@ impl Tiled {
                 .and_then(|n| n.checked_mul(u32::from(tiling.DepthInTiles)))
                 .unwrap_or(0);
             if tiles == 0 || tiles > HEAP_TILES || tiling.StartTileIndexInOverallResource == D3D12_PACKED_TILE {
+                say("a level's tiles");
                 return None;
             }
             standard.push(tiles);
         }
         let packed_tiles = if packed.NumPackedMips > 0 { packed.NumTilesForPackedMips } else { 0 };
         if (packed.NumPackedMips > 0 && packed_tiles == 0) || packed_tiles > HEAP_TILES {
+            say("packed tiles");
             return None;
         }
         let full = u64::from(total) * TILE;
@@ -687,6 +727,13 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
 pub(crate) fn status() {
     static BEFORE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    if wanted() {
+        let g: Vec<u64> = GATE.iter().map(|g| g.load(Ordering::Relaxed)).collect();
+        tracing::info!(
+            "levels on demand, host copies past each test so far: shape {}, placed {}, readable {}, not all held {}, reserved made {}; made by level {}",
+            g[0], g[1], g[2], g[3], g[4], s[4]
+        );
+    }
     if s[4] == 0 {
         return;
     }
