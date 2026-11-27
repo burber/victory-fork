@@ -3209,6 +3209,15 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
+        // Once: every image the pass reads or writes, by place, with its
+        // format and size (which is the history, which the motion).
+        static LISTED: std::sync::Once = std::sync::Once::new();
+        LISTED.call_once(|| {
+            for u in t.used.iter().filter(|u| u.root == RootType::Table) {
+                let d = entry(u.kind, (u.slot, u.table_offset_dwords)).map(|(d, _)| (d.Format, d.Width, d.Height, d.Dimension));
+                tracing::info!(kind = ?u.kind, slot = u.slot, offset = u.table_offset_dwords, desc = ?d, "FSR 4 last pass uses");
+            }
+        });
         let Some((_, frame)) = entry(ResourceType::Srv, SOURCE_AT) else {
             once!("no plain upscale: the frame's view is not found");
             return false;
@@ -3224,7 +3233,12 @@ impl State {
             return false;
         }
         once!(targets = targets.len(), size = ?targets[0].size, "plain upscale in place of FSR 4's last pass");
-        crate::upscale::instead(list, frame, &targets)
+        let history = (crate::upscale::taa() > 0.0)
+            .then(|| entry(ResourceType::Srv, crate::upscale::HISTORY_AT))
+            .flatten()
+            .filter(|(d, _)| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+            .map(|(_, v)| v);
+        crate::upscale::instead(list, frame, history, &targets)
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`

@@ -28,6 +28,23 @@ pub(crate) const LAST_PASS: &str = "fdce2a0a9fb1521a";
 /// Where that pass's images are: root parameter and place in its table, in
 /// dwords (the frame it reads, then the three it writes).
 pub(crate) const SOURCE_AT: (u8, u32) = (1, 24);
+/// The 1920x1080 picture the pass reads besides the frame: the last frame's
+/// output (its history), `t9`.
+pub(crate) const HISTORY_AT: (u8, u32) = (1, 72);
+
+/// How much of the history each pixel keeps, 0 (none: the plain upscale)
+/// to 0.95 (`VICTORY_SIMPLE_TAA`, 0.8 when set without a number; unset:
+/// none). The history is first held to the colours around the pixel in the
+/// new frame (a box in YCoCg, 3x3 of its texels): what the title dithers
+/// from frame to frame (hair, foliage, the edges its jitter moves) settles
+/// into its average, and what moved is let go rather than left as a trail.
+pub(crate) fn taa() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| match std::env::var("VICTORY_SIMPLE_TAA") {
+        Ok(v) => v.trim().parse::<f32>().ok().filter(|v| v.is_finite()).map_or(0.8, |v| v.clamp(0.0, 0.95)),
+        Err(_) => 0.0,
+    })
+}
 pub(crate) const TARGETS_AT: [(u8, u32); 3] = [(0, 8), (0, 48), (0, 16)];
 
 /// Whether the pass is replaced.
@@ -49,12 +66,14 @@ fn sharpen() -> f32 {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=1, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), " \
-    "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
-cbuffer Set : register(b0) { float amount; };
+#define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), DescriptorTable(SRV(t1)), "     "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+cbuffer Set : register(b0) { float amount; float keep; };
 Texture2D<float4> frame : register(t0);
+Texture2D<float4> history : register(t1);
 RWTexture2D<float4> target : register(u0);
 SamplerState linear_clamp : register(s0);
+float3 ycocg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
+float3 rgb(float3 y) { return float3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 at : SV_DispatchThreadID) {
@@ -66,16 +85,33 @@ void main(uint3 at : SV_DispatchThreadID) {
     float2 uv = (float2(at.xy) + 0.5) / float2(w, h);
     float2 texel = 1.0 / float2(fw, fh);
     float4 c = frame.SampleLevel(linear_clamp, uv, 0);
-    // A light unsharp mask on the frame's own texels, bounded by the
-    // neighbours so that it rings nowhere.
     float3 n = frame.SampleLevel(linear_clamp, uv + float2(0, -texel.y), 0).rgb;
     float3 s = frame.SampleLevel(linear_clamp, uv + float2(0, texel.y), 0).rgb;
     float3 e = frame.SampleLevel(linear_clamp, uv + float2(texel.x, 0), 0).rgb;
     float3 w4 = frame.SampleLevel(linear_clamp, uv + float2(-texel.x, 0), 0).rgb;
     float3 lo = min(c.rgb, min(min(n, s), min(e, w4)));
     float3 hi = max(c.rgb, max(max(n, s), max(e, w4)));
-    float3 sharp = c.rgb + amount * (4.0 * c.rgb - n - s - e - w4) * 0.25;
-    target[at.xy] = float4(clamp(sharp, lo, hi), c.a);
+    float3 sharp = clamp(c.rgb + amount * (4.0 * c.rgb - n - s - e - w4) * 0.25, lo, hi);
+    if (keep > 0) {
+        // The history held to the new frame's 3x3 neighbourhood (corners
+        // too), as a mean and spread in YCoCg.
+        float3 m1 = 0, m2 = 0;
+        [unroll] for (int y = -1; y <= 1; y++) {
+            [unroll] for (int x = -1; x <= 1; x++) {
+                float3 v = ycocg(frame.SampleLevel(linear_clamp, uv + float2(x, y) * texel, 0).rgb);
+                m1 += v; m2 += v * v;
+            }
+        }
+        m1 /= 9; m2 /= 9;
+        float3 sigma = sqrt(max(m2 - m1 * m1, 0));
+        uint hw, hh;
+        history.GetDimensions(hw, hh);
+        float3 old = history.SampleLevel(linear_clamp, uv, 0).rgb;
+        float3 held = rgb(clamp(ycocg(old), m1 - 1.25 * sigma, m1 + 1.25 * sigma));
+        bool usable = hw == w && hh == h && all(isfinite(old));
+        sharp = usable ? lerp(sharp, held, keep) : sharp;
+    }
+    target[at.xy] = float4(sharp, c.a);
 }
 "#;
 
@@ -131,22 +167,25 @@ pub(crate) struct Target {
 /// into each of `targets`, in place of the title's pass. Replaces the list's
 /// compute root signature and pipeline; false if it recorded nothing (the
 /// title's pass then runs).
-pub(crate) fn instead(list: &HostList, frame: D3D12_GPU_DESCRIPTOR_HANDLE, targets: &[Target]) -> bool {
+pub(crate) fn instead(list: &HostList, frame: D3D12_GPU_DESCRIPTOR_HANDLE, history: Option<D3D12_GPU_DESCRIPTOR_HANDLE>, targets: &[Target]) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
     if targets.is_empty() {
         return false;
     }
-    let amount = sharpen().to_bits();
+    let keep = if history.is_some() { taa() } else { 0.0 };
+    let set = [sharpen().to_bits(), keep.to_bits()];
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's pass
     // was bound, so its images are in the states its views need.
     unsafe {
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
-        l.SetComputeRoot32BitConstants(0, 1, (&raw const amount).cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 2, set.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, frame);
+        // Without a history the frame stands in (its size differs: unused).
+        l.SetComputeRootDescriptorTable(3, history.unwrap_or(frame));
         for t in targets {
             l.SetComputeRootDescriptorTable(2, t.view);
             l.Dispatch(t.size[0].div_ceil(8), t.size[1].div_ceil(8), 1);
