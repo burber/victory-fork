@@ -168,6 +168,27 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// [`place_for`] for a card copy's CPU side ([`place_staging`]): private
+/// memory committed whole, opened where it is, whatever `VICTORY_INPLACE`
+/// says; `None` for view memory or memory that cannot be opened.
+fn place_for_any(start: u64, len: u64) -> Option<Placed> {
+    if cover(start as usize, len as usize) != Cover::None {
+        return None;
+    }
+    let host = crate::host::host()?;
+    match place_part(&host.device, start, len) {
+        Ok(placed) => Some(placed),
+        Err(Some(e)) => {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "a card copy's title memory not opened in place");
+            }
+            None
+        }
+        Err(None) => None,
+    }
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -328,12 +349,12 @@ static CSTATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// below 4 GiB and view memory that is one run of a section.
 fn constants_wanted(start: u64, len: u64, min: u64) -> bool {
     len >= min.max(1)
-        && start.checked_add(len).is_some_and(|end| end <= LOW)
+        && (views_on() || start.checked_add(len).is_some_and(|end| end <= LOW))
         && match cover(start as usize, len as usize) {
             Cover::Run(..) => true,
             // Pieces of sections side by side: stitched in a view of ours
             // (`VICTORY_INPLACE_STITCH`, on).
-            Cover::Scattered => stitch_on() && pieces(start as usize, len as usize).is_some(),
+            Cover::Scattered => !views_on() && stitch_on() && pieces(start as usize, len as usize).is_some(),
             _ => false,
         }
 }
@@ -407,6 +428,82 @@ pub(crate) fn place_constants(start: u64, len: u64, fresh: bool) -> Option<Place
             if CSTATS[stat].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(start = format_args!("{start:#x}"), len, why, "the constants heap not in place: a copy as before (VICTORY_INPLACE_CONSTANTS)");
             }
+            None
+        }
+    }
+}
+
+/// `VICTORY_INPLACE_VIEWS=1`: every title buffer in view memory that is one
+/// run of a section (the runtime binds fresh pages by address, so most are)
+/// is a buffer placed in a heap opened on the title's own pages, as the
+/// constants heap is ([`place_constants`]): the card reads and writes the
+/// title's bytes, the title sees the card's writes, and nothing is
+/// refreshed, sent up, hashed, compared or copied back for it. Not the big
+/// buffers the card keeps a copy of in its own memory (the caller's).
+pub(crate) fn views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("title buffers in view memory are read and written by the card in place (VICTORY_INPLACE_VIEWS=1)");
+        }
+        on
+    })
+}
+
+/// For a big title buffer the card keeps a copy of in its own memory
+/// ([`views_on`]): a buffer placed over the title's own pages, which the
+/// copy takes what changed from (its CPU side). Only for a buffer that
+/// starts on a 64 KiB page (the placed buffer's offsets are the copy's).
+pub(crate) fn place_staging(start: u64, len: u64) -> Option<Placed> {
+    if !views_on() || len == 0 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    // Private memory (the title's heaps): opened where it is committed whole
+    // ([`place_for`]'s way); else view memory bound by address.
+    let private = place_for_any(start, len);
+    match private.map(|p| Ok(Some(p))).unwrap_or_else(|| constants_place(&host.device, start, len, 1, true)) {
+        Ok(Some(placed)) => {
+            let n = STAGING_PLACED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let bytes = STAGING_PLACED[1].fetch_add(len, Ordering::Relaxed) + len;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    copies = n,
+                    mb = bytes >> 20,
+                    not = STAGING_PLACED[2].load(Ordering::Relaxed),
+                    "card copies that take what changed from the title's own memory (VICTORY_INPLACE_VIEWS)"
+                );
+            }
+            Some(placed)
+        }
+        _ => {
+            STAGING_PLACED[2].fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Card copies whose CPU side is the title's memory: how many, their
+/// bytes; and how many could not be.
+pub(crate) static STAGING_PLACED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`place_constants`] for any title buffer in view memory ([`views_on`]).
+pub(crate) fn place_view(start: u64, len: u64, fresh: bool) -> Option<Placed> {
+    if !views_on() || len == 0 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    match constants_place(&host.device, start, len, 1, fresh) {
+        Ok(Some(placed)) => {
+            STATS[2].fetch_add(1, Ordering::Relaxed);
+            STATS[3].fetch_add(len, Ordering::Relaxed);
+            CSTATS[2].fetch_add(1, Ordering::Relaxed);
+            Some(placed)
+        }
+        Ok(None) => None,
+        Err((stat, _)) => {
+            CSTATS[stat].fetch_add(1, Ordering::Relaxed);
             None
         }
     }

@@ -178,6 +178,10 @@ pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 struct Copy {
     runs: Vec<(usize, u64, usize)>,
     pairs: (u64, u32),
+    /// For a copy whose CPU side is the title's own memory
+    /// (`Shadow::title_side`): its ranges, copied by the card straight from
+    /// there, nothing of them read on the CPU.
+    direct: Vec<(usize, usize)>,
 }
 
 /// Where a submission's bytes are taken to.
@@ -198,23 +202,30 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
+    for (shadow, ranges) in dirty {
+        if shadow.title_side() {
+            copies.push(Copy { runs: Vec::new(), pairs: (at, 0), direct: ranges.clone() });
+            continue;
+        }
         let mut runs = Vec::new();
         for &(a, b) in ranges.iter().filter(|r| !short(r)) {
             runs.push((a, at, b - a));
             at += ((b - a) as u64).next_multiple_of(16);
         }
         let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
+        copies.push(Copy { runs, pairs: (at, words as u32), direct: Vec::new() });
         at += (words as u64 * 8).next_multiple_of(16);
     }
-    if at == 0 {
+    if at == 0 && copies.iter().all(|c| c.direct.is_empty()) {
         return None;
     }
-    let memory = memory(host, at)?;
+    let memory = memory(host, at.max(256))?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+        if !copy.direct.is_empty() || shadow.title_side() {
+            continue;
+        }
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
         // (80,000 runs of some words a frame: in pieces of work.)
@@ -276,7 +287,16 @@ impl Own {
                 // SAFETY: the caller's; live buffers, ranges inside them.
                 unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
             }
-            let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
+            if !copy.direct.is_empty()
+                && let Some((staging, _, _)) = shadow.card_sides()
+            {
+                for &(a, b) in &copy.direct {
+                    // SAFETY: as above; the staging buffer is placed over the
+                    // title's pages at the copy's offsets.
+                    unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64 + shadow.staging_bias(), (b - a) as u64) };
+                }
+            }
+            let mut state = (looked(shadow) || !copy.runs.is_empty() || !copy.direct.is_empty()).then_some(dest);
             if copy.pairs.1 > 0 {
                 if let Some(was) = state {
                     first.push(transition(&shadow.buffer, was, write));

@@ -765,6 +765,9 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     // Dropped without the lock: the last page of a section unmaps its window.
     let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
     drop(table);
+    if rebind_min() > 0 {
+        unbind(&gone);
+    }
     drop(gone);
     1
 }
@@ -1187,23 +1190,45 @@ pub extern "system" fn XMemMapPhysicalPages(
 
 /// The fewest bytes a call of [`XMemMapPhysicalPages`] maps for its pages
 /// to be bound afresh ([`rebind_fresh`]): `VICTORY_XMEM_REBIND_MB`, 16; 0
-/// off. Off unless `VICTORY_INPLACE_CONSTANTS=1` when not set.
+/// off. Off unless `VICTORY_INPLACE_CONSTANTS=1` when not set; with
+/// [`views_in_place`] every mapping (one page and up).
 fn rebind_min() -> usize {
     static MIN: LazyLock<usize> = LazyLock::new(|| match std::env::var("VICTORY_XMEM_REBIND_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
         Some(mb) => mb << 20,
+        None if views_in_place() => PAGE,
         None if std::env::var_os("VICTORY_INPLACE_CONSTANTS").is_some_and(|v| v == "1") => 16 << 20,
         None => 0,
     });
     *MIN
 }
 
-/// The title's graphics memory for 32-bit addresses ends here.
-const LOW_END: usize = 1 << 32;
+/// `VICTORY_INPLACE_VIEWS=1`: the title's graphics memory is the card's
+/// memory too, without copies (`victory_gpu` `inplace`): every fresh page the
+/// title maps is bound by its address ([`rebind_pages`]), so that what it
+/// maps under its buffers is one run of one section, which the host opens
+/// as a heap where the title has it.
+pub(crate) fn views_in_place() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_some_and(|v| v == "1"));
+    *ON
+}
 
-/// A section as long as the low 4 GiB, made reserved (nothing committed,
+/// Where the section by address ends ([`by_address`]): the low 4 GiB, or
+/// with [`views_in_place`] `VICTORY_BY_ADDRESS_GB` (64) of them.
+fn address_end() -> usize {
+    static END: LazyLock<usize> = LazyLock::new(|| {
+        if views_in_place() {
+            std::env::var("VICTORY_BY_ADDRESS_GB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(64) << 30
+        } else {
+            1 << 32
+        }
+    });
+    *END
+}
+
+/// A section as long as [`address_end`], made reserved (nothing committed,
 /// nothing taken from the PC until a page of it is), whose page `k` backs
-/// address `k * PAGE` ([`rebind_fresh`]); and which of its pages are
-/// bound to a title page already.
+/// address `k * PAGE` ([`rebind_pages`]); and which of its pages are bound
+/// to a title page now.
 struct ByAddress {
     section: Arc<Section>,
     used: Mutex<Vec<u64>>,
@@ -1211,23 +1236,25 @@ struct ByAddress {
 
 fn by_address() -> Option<&'static ByAddress> {
     static IT: LazyLock<Option<ByAddress>> = LazyLock::new(|| {
-        let n = LOW_END / PAGE;
+        let end = address_end();
+        let n = end / PAGE;
         // SAFETY: plain section creation, as `XMemAllocatePhysicalPages`.
         let handle = unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
                 PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-                (LOW_END as u64 >> 32) as u32,
-                LOW_END as u32,
+                (end as u64 >> 32) as u32,
+                end as u32,
                 std::ptr::null(),
             )
         };
         if handle.is_null() {
-            tracing::warn!(error = %std::io::Error::last_os_error(), "no section by address (VICTORY_XMEM_REBIND_MB)");
+            tracing::warn!(error = %std::io::Error::last_os_error(), "no section by address");
             return None;
         }
-        victory_gpu::title_memory_section(handle as usize, LOW_END as u64, on_wine());
+        victory_gpu::title_memory_section(handle as usize, end as u64, on_wine());
+        tracing::info!(gb = end >> 30, "title pages bound by address: a section of their own over the low addresses");
         Some(ByAddress {
             section: Arc::new(Section {
                 handle,
@@ -1241,84 +1268,92 @@ fn by_address() -> Option<&'static ByAddress> {
     IT.as_ref()
 }
 
-/// Before a big mapping call at `base` below 4 GiB: if none of `pages`
-/// was ever mapped or written (no page of theirs committed in its
-/// section), none is there twice, and the pages of the section by address
-/// ([`by_address`]) for `[base, base + n pages)` are not bound yet, the
-/// title's pages are bound to those. Page numbers are ours to give and a
-/// page never committed holds zeros wherever it lives, so the title sees
-/// nothing change; what changes is that title memory mapped with fresh
-/// pages is, whatever the order of its calls, one run of one section.
-///
-/// Why: the title's 182 MB constants heap (0x37200000 in one run) is
-/// mapped in three calls (27, 47 and 100 MB), each a run of its 6.1 GiB
-/// pool, the calls in another order than their addresses: three views of
-/// the pool that do not follow on. The host opens a heap on one view only
-/// (`OpenExistingHeapFromAddress1` over two: E_INVALIDARG), so the heap
-/// could not be in place (`victory_gpu`, `VICTORY_INPLACE_CONSTANTS`).
-///
-/// shortcut: a page of the section by address, once bound, stays bound
-/// (its address is not given to another title page again).
+/// Pages bound by address since the start, and pages that could not be
+/// (seen before, or their address's page taken).
+static REBOUND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Before a mapping call of `pages` at `base`: [`rebind_pages`] for each.
 fn rebind_fresh(base: usize, pages: &[usize]) {
     let min = rebind_min();
-    let n = pages.len();
-    if min == 0 || n * PAGE < min || !base.is_multiple_of(PAGE) || base + n * PAGE > LOW_END {
+    if min == 0 || pages.len() * PAGE < min || !base.is_multiple_of(PAGE) {
+        return;
+    }
+    let wanted: Vec<(usize, usize)> = pages.iter().enumerate().map(|(k, &p)| (base + k * PAGE, p)).collect();
+    rebind_pages(&wanted);
+}
+
+/// Each title page of `wanted` (address, page number) that was never
+/// mapped or written (no page of it committed in its section), is there
+/// once, lies below [`address_end`] and whose address's page of the
+/// section by address ([`by_address`]) is not bound now, is bound to that
+/// page. Page numbers are ours to give, and a page never committed holds
+/// zeros wherever it lives, so the title sees nothing change; what changes
+/// is that title memory mapped with fresh pages is, whatever the order of
+/// its calls, one run of one section.
+///
+/// Why: the title's constants heap is mapped in three calls whose pool
+/// pages do not follow on, and its buffers elsewhere in pages of the pool
+/// in any order; the host opens a heap on one view only
+/// (`OpenExistingHeapFromAddress1` over two: E_INVALIDARG), so none could be
+/// in place.
+fn rebind_pages(wanted: &[(usize, usize)]) {
+    if rebind_min() == 0 {
         return;
     }
     let Some(by) = by_address() else {
         return;
     };
+    let end = address_end();
     let mut table = page_table_mut();
-    let mut seen = std::collections::HashSet::with_capacity(n);
-    let (mut unknown, mut committed, mut twice) = (0usize, 0usize, 0usize);
-    for page in pages {
-        let Some(slice) = table.pages.get(page) else {
-            unknown += 1;
+    let mut used = by.used.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = std::collections::HashSet::with_capacity(wanted.len());
+    let mut old: Vec<Slice> = Vec::new();
+    let (mut bound, mut left) = (0u64, 0u64);
+    for &(at, page) in wanted {
+        if page == 0 || !at.is_multiple_of(PAGE) || at + PAGE > end {
+            continue;
+        }
+        let Some(slice) = table.pages.get(&page) else {
             continue;
         };
-        committed += usize::from(slice.section.committed[slice.index / 64].load(Ordering::Acquire) >> (slice.index % 64) & 1 != 0);
-        twice += usize::from(!seen.insert(*page));
-    }
-    let first = base / PAGE;
-    let mut used = by.used.lock().unwrap_or_else(|e| e.into_inner());
-    let taken = (first..first + n).filter(|&k| used[k / 64] >> (k % 64) & 1 != 0).count();
-    if unknown + committed + twice + taken > 0 {
-        tracing::info!(
-            address = format_args!("{base:#x}"),
-            n,
-            unknown,
-            committed,
-            twice,
-            taken,
-            "a big mapping's pages not bound afresh (VICTORY_XMEM_REBIND_MB)"
-        );
-        return;
-    }
-    for k in first..first + n {
+        if Arc::ptr_eq(&slice.section, &by.section) {
+            continue;
+        }
+        let k = at / PAGE;
+        let committed = slice.section.committed[slice.index / 64].load(Ordering::Acquire) >> (slice.index % 64) & 1 != 0;
+        if committed || !seen.insert(page) || used[k / 64] >> (k % 64) & 1 != 0 {
+            left += 1;
+            continue;
+        }
         used[k / 64] |= 1 << (k % 64);
+        if let Some(was) = table.pages.insert(page, Slice { section: by.section.clone(), index: k }) {
+            old.push(was);
+        }
+        bound += 1;
     }
     drop(used);
-    let old: Vec<Slice> = pages
-        .iter()
-        .enumerate()
-        .filter_map(|(k, page)| {
-            table.pages.insert(
-                *page,
-                Slice {
-                    section: by.section.clone(),
-                    index: first + k,
-                },
-            )
-        })
-        .collect();
     drop(table);
-    tracing::info!(
-        address = format_args!("{base:#x}"),
-        n,
-        "a big mapping's fresh pages bound to the section by address (VICTORY_XMEM_REBIND_MB)"
-    );
+    let all = REBOUND[0].fetch_add(bound, Ordering::Relaxed) + bound;
+    REBOUND[1].fetch_add(left, Ordering::Relaxed);
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if all >> 14 > SAID.load(Ordering::Relaxed) {
+        SAID.store(all >> 14, Ordering::Relaxed);
+        tracing::info!(bound = all, left = REBOUND[1].load(Ordering::Relaxed), "title pages bound by address so far");
+    }
     // The old slices go without the lock (a section's last one unmaps its window).
     drop(old);
+}
+
+/// The title frees pages: those bound by address give their address's
+/// page back ([`rebind_pages`]).
+fn unbind(pages: &[Slice]) {
+    let Some(by) = by_address() else {
+        return;
+    };
+    let mut used = by.used.lock().unwrap_or_else(|e| e.into_inner());
+    for s in pages.iter().filter(|s| Arc::ptr_eq(&s.section, &by.section)) {
+        used[s.index / 64] &= !(1 << (s.index % 64));
+    }
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -1332,8 +1367,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         return 0;
     }
     lift_thread();
-    if rebind_min() > 0 && n * PAGE >= rebind_min() {
-        tracing::info!(n, "a big XMemMapPhysicalPagesScatter (not bound afresh: scatter)");
+    if views_in_place() && !pages.is_null() {
+        let wanted: Vec<(usize, usize)> = (0..n)
+            // SAFETY: the title passes `n` addresses and `n` pages.
+            .map(|i| unsafe { (*addresses.add(i) as usize, *pages.add(i)) })
+            .collect();
+        rebind_pages(&wanted);
     }
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.

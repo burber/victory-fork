@@ -111,6 +111,10 @@ struct Card {
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission.
     staging: ID3D12Resource,
+    /// Bytes from `staging`'s first byte to the copy's first: 0, but for a
+    /// CPU side placed over the title's own pages (`Shadow::title_side`),
+    /// which begins on the 64 KiB page the title memory lies in.
+    bias: u64,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -610,6 +614,18 @@ impl SentRuns {
         }
         sent
     }
+}
+
+/// Whether copies whose CPU side is the title's own memory
+/// (`Shadow::title_side`) are refreshed without change tracking: every range
+/// a submission refreshes goes up whole, copied by the card from the title's
+/// pages, and the processor neither asks the write watch nor looks at a page
+/// (`VICTORY_UNTRACKED=1`; off: run 314 sent 2.9 GB a frame that way, the
+/// ranges submissions refresh being 5.5 GB, and the card took 150-170 ms a
+/// frame over the bus: 5 fps).
+pub(crate) fn untracked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNTRACKED").is_some_and(|v| v == "1"))
 }
 
 /// `VICTORY_BACK_CARD_NONE=1` (an experiment, off): shader writes in copies
@@ -3864,6 +3880,10 @@ impl Shadow {
             }
             MERGED[0].fetch_add(1, Ordering::Relaxed);
             let at = lo - self.start as usize;
+            if self.title_side() {
+                self.card_changed(at, at + n);
+                return Ok(Some(vec![(0, n)]));
+            }
             // SAFETY: the caller's.
             let held = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
             if self.card.is_some() {
@@ -3977,6 +3997,14 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // A copy whose CPU side is the title's own memory: nothing is asked
+        // of the write watch and no page is looked at; the card copies the
+        // range from the title's pages as it is (`VICTORY_UNTRACKED=0`: asked,
+        // as for any copy).
+        if self.title_side() && untracked() {
+            self.card_changed(from - self.start as usize, to - self.start as usize);
+            return to - from;
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
@@ -4290,6 +4318,17 @@ impl Shadow {
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    /// [`Card::bias`] (0 for a copy not in the card's memory).
+    pub(crate) fn staging_bias(&self) -> u64 {
+        self.card.as_ref().map_or(0, |c| c.bias)
+    }
+
+    /// Whether this copy's CPU side is the title's own memory
+    /// (`VICTORY_INPLACE_VIEWS`): what the title writes is there already.
+    pub(crate) fn title_side(&self) -> bool {
+        self.card.is_some() && self.data as usize == self.start as usize
+    }
+
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
@@ -4302,7 +4341,7 @@ impl Shadow {
                 crate::host::copy_mapped(unsafe { self.data.add(a) }, (start + a) as *const u8, b - a, false);
                 crate::host::upcheck::note(self.id, a, &was, &self.card_held(a, b - a));
             });
-        } else {
+        } else if !self.title_side() {
             crate::host::copy_mapped(at, from as *const u8, to - from, false);
         }
         // After the bytes are in: a snapshot taken meanwhile is not current.
@@ -4706,6 +4745,7 @@ impl Shadow {
         if card {
             shadow.card = Some(Card {
                 staging: none(),
+                bias: 0,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -4868,6 +4908,7 @@ mod land_tests {
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
             staging: buffer,
+            bias: 0,
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -5258,7 +5299,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     // whether no title buffer in its pages has one either (the constants
     // heap opens a region only then: one memory, one form,
     // `crate::inplace::place_constants`).
-    let fresh = crate::inplace::constants_on()
+    let fresh = (crate::inplace::constants_on() || crate::inplace::views_on())
         && map.get(&key).is_some_and(|entry| entry.shadow.is_none())
         && {
             let (at, to) = crate::inplace::pages_of_range(key.0, map.get(&key).map_or(0, |entry| entry.end - key.0));
@@ -5283,11 +5324,25 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // Any title buffer in view memory, in place (`crate::inplace::views_on`).
+        if !big && let Some(placed) = crate::inplace::place_view(key.0, len, fresh) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        // With `VICTORY_INPLACE_VIEWS`, a big one's CPU side is the title's
+        // own memory, opened for the card where the title has it: no copy
+        // into a side of ours, the card takes what changed from the title's
+        // pages themselves (`crate::inplace::place_staging`).
+        let title_side = if big { crate::inplace::place_staging(key.0, len) } else { None };
+        let (buffer, data) = match &title_side {
+            Some(placed) => (placed.buffer.clone(), key.0 as *mut u8),
+            None => host()?.shared_buffer(size)?,
+        };
+        let staging_bias = title_side.as_ref().map_or(0, |p| p.bias);
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
@@ -5301,6 +5356,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 );
                 let card = Card {
                     staging: buffer,
+                    bias: staging_bias,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -5529,6 +5585,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
+        bias: 0,
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -5618,6 +5675,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
                 staging: buffer,
+                bias: 0,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),

@@ -4324,7 +4324,7 @@ impl Host {
                         };
                         if own.is_none() {
                             for &(a, b) in ranges {
-                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64 + shadow.staging_bias(), (b - a) as u64);
                             }
                         }
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
