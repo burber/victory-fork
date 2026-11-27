@@ -806,8 +806,18 @@ impl Tracked {
     }
 }
 
-/// Guarded blocks of view memory.
-const BLOCK: usize = PAGE;
+/// Guarded blocks of view memory: the 64 KiB page. In 64 KiB
+/// blocks a write by the title to any object sharing a block with graphics
+/// data faulted, and opened, the whole block: 250 faults a frame in the
+/// first chapter, most of them free lists, reference counts and flags
+/// (sites in run 315).
+///
+/// shortcut: 4 KiB blocks (`VICTORY_GUARD_BLOCK_4K` at build time) lost the
+/// card while the first chapter loaded (run 318): code that maps a block to
+/// its view page (`crate::inplace::beside_page`, the landing beside the
+/// guards) still takes a block for a 64 KiB page. 64 KiB until that is
+/// sorted out.
+const BLOCK: usize = if option_env!("VICTORY_GUARD_BLOCK_4K").is_some() { KERNEL_PAGE } else { PAGE };
 
 /// Whether the refreshes of host copies go the light way
 /// (`VICTORY_LIGHT_REFRESH=0`: as before): view memory nothing wrote since

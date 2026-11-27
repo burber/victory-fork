@@ -300,7 +300,7 @@ impl Drop for SyncedHeaps {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn heap_writers_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WRITERS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WRITERS").is_some_and(|v| v == "1" || v == "all"))
 }
 
 #[cfg(feature = "diagnostics")]
@@ -310,13 +310,16 @@ static HEAP_WRITERS: std::sync::Mutex<Option<std::collections::HashMap<usize, u6
 /// a shader heap. From the fault handler: never waits for a lock.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn heap_write_fault(at: usize, rip: usize) {
-    let Ok(heaps) = SHADER_HEAPS.try_read() else {
-        return;
-    };
-    if !heaps.iter().any(|&(start, end, _)| (start as usize) <= at && at < end as usize) {
-        return;
+    // `VICTORY_HEAP_WRITERS=all`: every guarded write, not only the heaps'.
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ALL.get_or_init(|| std::env::var_os("VICTORY_HEAP_WRITERS").is_some_and(|v| v == "all")) {
+        let Ok(heaps) = SHADER_HEAPS.try_read() else {
+            return;
+        };
+        if !heaps.iter().any(|&(start, end, _)| (start as usize) <= at && at < end as usize) {
+            return;
+        }
     }
-    drop(heaps);
     if let Ok(mut w) = HEAP_WRITERS.try_lock() {
         *w.get_or_insert_with(Default::default).entry(rip).or_default() += 1;
     }
@@ -366,7 +369,7 @@ fn heap_writers_say() {
     let mut all = all;
     all.sort_by_key(|x| std::cmp::Reverse(x.1));
     let total: u64 = all.iter().map(|x| x.1).sum();
-    let top: Vec<String> = all.iter().take(24).map(|(rip, n)| format!("{}:{n}", where_is(*rip))).collect();
+    let top: Vec<String> = all.iter().take(40).map(|(rip, n)| format!("{}:{n}", where_is(*rip))).collect();
     tracing::info!("write faults in shader heaps, 10 s: {total} at {} sites; most: {}", all.len(), top.join(" "));
 }
 
