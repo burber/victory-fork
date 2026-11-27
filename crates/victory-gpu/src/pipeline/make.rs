@@ -156,7 +156,7 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(format!("being made {}", hashes(p))),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
