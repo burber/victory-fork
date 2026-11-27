@@ -612,6 +612,15 @@ impl SentRuns {
     }
 }
 
+/// `VICTORY_BACK_CARD_NONE=1` (an experiment, off): shader writes in copies
+/// in the card's memory are not merged into title memory
+/// ([`Shadow::card_merge_relay`]). Tells whether the title reads them:
+/// if the picture holds without, most of the copy-back is for nothing.
+pub(crate) fn back_card_none() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_CARD_NONE").is_some_and(|v| v == "1"))
+}
+
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
 /// they touch. The ranges are taken: the caller copies them to the card's
@@ -4426,6 +4435,13 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
+        // Experiment: what shaders wrote in copies in the card's memory is
+        // left there and never reaches title memory. The CPU's side keeps
+        // what it held, so the title's own changes still go up as before;
+        // only what the title READS of shader writes is stale.
+        if back_card_none() {
+            return 0;
+        }
         if at + gpu.len() > self.len as usize {
             return 0;
         }
@@ -4532,6 +4548,9 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
+        if back_card_none() {
+            return 0;
+        }
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
