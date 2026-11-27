@@ -1198,10 +1198,22 @@ mod host {
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
-                for vk in scripted() {
+                let keys = scripted();
+                for &vk in &keys {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
+                }
+                // And its sticks, as the stand-in pad's (WASD left, IJKL
+                // right), so that a scripted run can walk and turn the camera.
+                let on = |vk: u8| if keys.contains(&vk) { 1.0 } else { 0.0 };
+                let (lx, ly) = (on(b'D') - on(b'A'), on(b'W') - on(b'S'));
+                let (rx, ry) = (on(b'L') - on(b'J'), on(b'I') - on(b'K'));
+                if lx != 0.0 || ly != 0.0 {
+                    (pad.left_x, pad.left_y) = (lx, ly);
+                }
+                if rx != 0.0 || ry != 0.0 {
+                    (pad.right_x, pad.right_y) = (rx, ry);
                 }
             }
             Some(pad)
