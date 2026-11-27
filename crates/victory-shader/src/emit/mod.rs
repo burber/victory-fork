@@ -565,8 +565,14 @@ pub fn emit(
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                // (`VICTORY_WAVE_WIDE=0` turns the second off.) The first is off unless
+                // `VICTORY_WAVE_DEEP_SKIPS=1`: on 32-lane NVIDIA it left half-resolution
+                // depth and lighting with wrong 8x8 tiles, seen as dark blocks along the
+                // hairline and on faces in every close-up, and the main character's
+                // hair came out blond instead of dark brown (runs 261-268); without it
+                // the same scenes are clean and the frame rate is the same (runs 269,
+                // 270: 30 fps).
+                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_some_and(|v| v == "1");
                 let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
