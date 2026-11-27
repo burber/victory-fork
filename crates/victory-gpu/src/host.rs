@@ -4621,7 +4621,7 @@ impl Host {
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
-                    .filter(|r| !r.picked)
+                    .filter(|r| !r.picked && !crate::shadow::back_card_skips(&r.shadow))
                     .flat_map(|r| {
                         (0..r.span.pieces).map(move |p| {
                             let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
@@ -4631,7 +4631,7 @@ impl Host {
                     })
                     .collect();
                 let fetched = flagged_pieces(&flags);
-                for r in plan.ranges.iter().filter(|r| !r.picked) {
+                for r in plan.ranges.iter().filter(|r| !r.picked && !crate::shadow::back_card_skips(&r.shadow)) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);

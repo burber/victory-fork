@@ -617,9 +617,76 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Tells whether the title reads them:
 /// if the picture holds without, most of the copy-back is for nothing.
 pub(crate) fn back_card_none() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_CARD_NONE").is_some_and(|v| v == "1"))
+    back_card_mode() != 0
 }
+
+/// `VICTORY_BACK_CARD_NONE`: 0 (unset) every copy's shader writes land;
+/// 1 none of a copy in the card's memory does; 2 (`alone`) none of such a
+/// copy that no other copy of title memory overlaps ([`Shadow::alone`]).
+pub(crate) fn back_card_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_CARD_NONE").as_deref() {
+        Ok("1") => 1,
+        Ok("2") | Ok("alone") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether what shaders wrote in `copy` (in the card's memory) is left
+/// there, not landed in title memory ([`back_card_mode`]).
+pub(crate) fn back_card_skips(copy: &Shadow) -> bool {
+    let mode = back_card_mode();
+    if mode == 0 || copy.len < back_card_min() {
+        return false;
+    }
+    match mode {
+        1 => true,
+        _ => copy.alone(),
+    }
+}
+
+/// `VICTORY_BACK_CARD_MIN_KB`: only copies of at least this many KiB are
+/// left unlanded ([`back_card_skips`]); 0 (unset) all.
+fn back_card_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("VICTORY_BACK_CARD_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 10)
+}
+
+/// Bytes landed by copy since the last line: id, start, bytes of the copy,
+/// bytes landed (`VICTORY_LAND_TALLY=1`).
+static LAND_TALLY: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, (u64, u64, u64)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn land_tally(copy: &Shadow, put: u64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TALLY").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let mut t = LAND_TALLY.lock().unwrap_or_else(|e| e.into_inner());
+    let e = t.entry(copy.id()).or_insert((copy.start, copy.len, 0));
+    e.2 += put;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if now >= LAST.load(Ordering::Relaxed) + 10_000 {
+        LAST.store(now, Ordering::Relaxed);
+        let mut all: Vec<(u64, (u64, u64, u64))> = t.drain().collect();
+        all.sort_by_key(|x| std::cmp::Reverse(x.1.2));
+        let total: u64 = all.iter().map(|x| x.1.2).sum();
+        let top: Vec<String> = all
+            .iter()
+            .take(20)
+            .map(|(id, (start, len, put))| format!("#{id} {start:#x}+{}K: {:.1}MB", len >> 10, *put as f64 / 1048576.0))
+            .collect();
+        tracing::info!("landed by copy, 10 s: {:.1} MB in {} copies; most: {}", total as f64 / 1048576.0, all.len(), top.join(", "));
+    }
+}
+
+/// [`Shadow::alone`]'s answers: by copy, the frame asked and the answer.
+static ALONE: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, (u64, bool)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Since the start: copies found alone and not, for the log.
+pub(crate) static ALONE_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
@@ -4151,6 +4218,58 @@ impl Shadow {
         to - from
     }
 
+    /// Whether no other copy holds any of this copy's title memory: then
+    /// what shaders write in it reaches nothing else through title memory
+    /// (only the CPU, if the title reads it). Asked again every 30 frames;
+    /// not sure (too many to look through): not alone.
+    pub(crate) fn alone(&self) -> bool {
+        let frame = crate::frame::current();
+        let id = self.id();
+        if let Some(&(asked, answer)) = ALONE.lock().unwrap_or_else(|e| e.into_inner()).get(&id)
+            && frame < asked + 30
+        {
+            return answer;
+        }
+        let answer = self.alone_now();
+        ALONE_STATS[usize::from(!answer)].fetch_add(1, Ordering::Relaxed);
+        ALONE.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (frame, answer));
+        answer
+    }
+
+    fn alone_now(&self) -> bool {
+        let (a, b) = (self.start, self.start + self.len);
+        let me = self as *const Shadow;
+        let other = |s: &Arc<Shadow>| !std::ptr::eq(Arc::as_ptr(s), me);
+        {
+            let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+            let mut looked = 0;
+            for (&(start, _), entry) in map.range(..(b, 0)).rev() {
+                looked += 1;
+                if looked > 4096 {
+                    return false;
+                }
+                if entry.end > a && start < b && entry.shadow.as_ref().is_some_and(other) {
+                    return false;
+                }
+            }
+        }
+        {
+            let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+            let mut looked = 0;
+            for (&(start, end), s) in loose.range(..(b, 0)).rev() {
+                looked += 1;
+                if looked > 4096 {
+                    return false;
+                }
+                if end > a && start < b && other(s) {
+                    return false;
+                }
+            }
+        }
+        let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        !exact.1.iter().any(|(&(start, end), (s, _))| start < b && end > a && other(s))
+    }
+
     /// Whether shaders read and write this copy in the card's own memory
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
@@ -4439,7 +4558,7 @@ impl Shadow {
         // left there and never reaches title memory. The CPU's side keeps
         // what it held, so the title's own changes still go up as before;
         // only what the title READS of shader writes is stale.
-        if back_card_none() {
+        if back_card_skips(self) {
             return 0;
         }
         if at + gpu.len() > self.len as usize {
@@ -4548,7 +4667,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
-        if back_card_none() {
+        if back_card_skips(self) {
             return 0;
         }
         let waiting = std::time::Instant::now();
@@ -4581,6 +4700,9 @@ impl Shadow {
                 self.note_landing(lo, hi);
             }
             put += merged;
+        }
+        if put > 0 {
+            land_tally(self, put);
         }
         put
     }
