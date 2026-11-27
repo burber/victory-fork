@@ -507,6 +507,15 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
+/// The shader hashes of the title's pipeline `this` (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn hashes_of(this: This) -> String {
+    if this.is_null() {
+        return String::new();
+    }
+    make::hashes(&pipeline(this).host)
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()

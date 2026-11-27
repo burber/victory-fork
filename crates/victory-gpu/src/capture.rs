@@ -361,10 +361,38 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
+thread_local! {
+    /// The title's pipeline of the draw or dispatch being recorded on this
+    /// thread, for the writers of dumped targets.
+    static CURRENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Writers of the targets noted this frame: resource, pipelines.
+static WRITERS: std::sync::Mutex<Vec<(usize, Vec<usize>)>> = std::sync::Mutex::new(Vec::new());
+
+/// The draw or dispatch being recorded uses the title's pipeline `p`.
+pub(crate) fn set_current(p: usize) {
+    if dump_on() {
+        CURRENT.set(p);
+    }
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
+    }
+    {
+        let p = CURRENT.get();
+        let mut w = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+        match w.iter_mut().find(|e| e.0 == resource as usize) {
+            Some(e) => {
+                if p != 0 && !e.1.contains(&p) {
+                    e.1.push(p);
+                }
+            }
+            None => w.push((resource as usize, if p != 0 { vec![p] } else { Vec::new() })),
+        }
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
@@ -378,6 +406,21 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let writers = std::mem::take(&mut *WRITERS.lock().unwrap_or_else(|e| e.into_inner()));
+    // Which pipelines wrote each target, as a text file beside the pictures.
+    if let Some(dir) = folder() {
+        let mut text = String::new();
+        for (i, (resource, _)) in targets.iter().enumerate() {
+            let ws: Vec<String> = writers
+                .iter()
+                .find(|e| e.0 == *resource)
+                .map(|e| e.1.iter().map(|&p| crate::pipeline::hashes_of(p as crate::object::This)).collect())
+                .unwrap_or_default();
+            text.push_str(&format!("{i:02} {resource:#x} {}
+", ws.join(" ")));
+        }
+        let _ = std::fs::write(dir.join(format!("frame-{frame}-writers.txt")), text);
+    }
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;

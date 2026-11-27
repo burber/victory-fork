@@ -3085,6 +3085,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::set_current(self.pipeline);
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -3555,6 +3557,12 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::set_current(self.pipeline);
+        #[cfg(feature = "diagnostics")]
+        for &t in &self.targets {
+            crate::capture::note_target(t as This);
+        }
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -4030,6 +4038,12 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::set_current(self.pipeline);
+        #[cfg(feature = "diagnostics")]
+        for &t in &self.targets {
+            crate::capture::note_target(t as This);
+        }
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -4139,6 +4153,12 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::set_current(self.pipeline);
+        #[cfg(feature = "diagnostics")]
+        for &t in &self.targets {
+            crate::capture::note_target(t as This);
+        }
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -4247,6 +4267,12 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::set_current(self.pipeline);
+        #[cfg(feature = "diagnostics")]
+        for &t in &self.targets {
+            crate::capture::note_target(t as This);
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
