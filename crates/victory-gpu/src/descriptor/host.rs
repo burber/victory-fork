@@ -194,6 +194,10 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// [`TextureQueue::maybe`], shared.
+    textures_maybe: std::sync::Arc<[std::sync::atomic::AtomicBool]>,
+    /// [`Spans::maybe`], shared.
+    placed_maybe: std::sync::Arc<[std::sync::atomic::AtomicBool]>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -279,6 +283,15 @@ struct Flip {
     /// The frame it was asked in, of a slot that shows nothing of the
     /// texture until then ([`HostHeap::texture_slot_show_after`]).
     late: Option<u64>,
+}
+
+/// `VICTORY_RECORD_FAST=0`: every slot the pass over records makes takes the
+/// heap's texture-queue and placed-span locks, as before. On (the default):
+/// not when the slot is surely in neither ([`TextureQueue::maybe`]); six
+/// threads queued on those locks for most of their time (timeline tl-28).
+fn record_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_FAST").is_none_or(|v| v != "0"))
 }
 
 /// Whether a title slot shows a texture that is new to it only once the
@@ -563,6 +576,9 @@ pub(crate) struct Spans {
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    /// Per slot: whether it may be in `by_slot` or `first` (as
+    /// [`TextureQueue`]'s), for [`HostHeap::note_buffer`] without the lock.
+    maybe: Option<std::sync::Arc<[std::sync::atomic::AtomicBool]>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -672,6 +688,7 @@ impl Spans {
             }
         }
         self.by_start.entry(start).or_insert_with(|| (end, Default::default())).1.insert(index);
+        mark(&self.maybe, index, true);
         self.by_slot.insert(index, start);
         stale
     }
@@ -679,6 +696,7 @@ impl Spans {
     /// The view in slot `index` starts at level `first` of its texture; the
     /// memory of that and the smaller levels ends at `end`.
     fn shows(&mut self, index: u32, first: u32, end: u64) {
+        mark(&self.maybe, index, true);
         self.first.insert(index, (first, end));
     }
 
@@ -706,6 +724,7 @@ impl Spans {
     /// Slot `index` holds no placed texture view any more.
     fn forget(&mut self, index: u32) {
         self.first.remove(&index);
+        mark(&self.maybe, index, false);
         let Some(start) = self.by_slot.remove(&index) else {
             return;
         };
@@ -954,6 +973,16 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// Per slot: whether it may be in `slots` (set before it goes in,
+    /// cleared under the lock when it comes out), for a look without the
+    /// lock ([`HostHeap::queue_texture`]).
+    maybe: Option<std::sync::Arc<[std::sync::atomic::AtomicBool]>>,
+}
+
+fn mark(maybe: &Option<std::sync::Arc<[std::sync::atomic::AtomicBool]>>, index: u32, on: bool) {
+    if let Some(m) = maybe.as_ref().and_then(|m| m.get(index as usize)) {
+        m.store(on, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl TextureQueue {
@@ -967,11 +996,13 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
+        mark(&self.maybe, index, true);
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
+        mark(&self.maybe, index, false);
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -1095,6 +1126,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+        mark(&self.maybe, index, true);
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
@@ -1590,6 +1622,8 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let maybe = || -> std::sync::Arc<[std::sync::atomic::AtomicBool]> { (0..count).map(|_| std::sync::atomic::AtomicBool::new(false)).collect() };
+        let (textures_maybe, placed_maybe) = (maybe(), maybe());
         let h = HostHeap {
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -1617,12 +1651,14 @@ impl HostHeap {
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
-            textures: Mutex::default(),
+            textures: Mutex::new(TextureQueue { maybe: Some(textures_maybe.clone()), ..Default::default() }),
+            textures_maybe,
+            placed_maybe: placed_maybe.clone(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             placed: {
-                let spans = std::sync::Arc::<Mutex<Spans>>::default();
+                let spans = std::sync::Arc::new(Mutex::new(Spans { maybe: Some(placed_maybe), ..Default::default() }));
                 if !sampler {
                     PLACED_SPANS
                         .lock()
@@ -2631,6 +2667,11 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        // Nothing to take out of a queue it is not in: no lock (taken by
+        // every slot the pass over records makes, from six threads).
+        if record_fast() && !(texture && !read_now) && !self.textures_maybe.get(index as usize).is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire)) {
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -2715,7 +2756,12 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // Not a placed view, and the slot holds none: nothing to forget, no
+        // lock (as [`HostHeap::queue_texture`]).
+        let none_here = record_fast() && placed_view.is_none() && !self.placed_maybe.get(index as usize).is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire));
+        let stale = if none_here {
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
