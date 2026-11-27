@@ -81,6 +81,21 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    // The spatial filters of the eyes' reflective caustics
+    // (`CS_ScreenProbes_TemporalResolve_ReflectiveCaustics` resolves them):
+    // without rays the screen probes hold the sky's light, and the filtered
+    // caustic lit every iris blue-white, indoors too. Left out, the eyes are
+    // as the lit picture has them (run 284); the resolve itself must run (left
+    // out, the whole frame fell apart: run 283). `VICTORY_EYE_CAUSTICS=1`
+    // keeps them.
+    static EYE_CAUSTICS: OnceLock<bool> = OnceLock::new();
+    let eye_caustics = *EYE_CAUSTICS.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+            || std::env::var_os("VICTORY_EYE_CAUSTICS").is_some_and(|v| v == "1")
+    });
+    if !eye_caustics && shaders.iter().any(|s| matches!(s.hash.as_str(), "63381c3250b287fa" | "ff6fdf23ce0b9048")) {
+        return Some("eye caustics filter without rays, left out");
+    }
     None
 }
 
