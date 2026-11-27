@@ -9289,6 +9289,7 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            pix_capture_at_present();
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -10717,4 +10718,56 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 pub(crate) fn fill_on_card() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_ON_CARD").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_PIX_CAPTURE_AT=<seconds>[,<frames>]`: with the title launched
+/// under PIX (`pixtool launch ... programmatic-capture`), one GPU capture of
+/// `<frames>` frames (1) taken that many seconds after the first present,
+/// through DXGI's graphics analysis (`IDXGraphicsAnalysis`). Without PIX the
+/// interface is not there and nothing happens.
+fn pix_capture_at_present() {
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGraphicsAnalysis};
+    static ASKED: OnceLock<Option<(u64, u32)>> = OnceLock::new();
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    // 0 waiting, 1 capturing, 2 done.
+    static STATE: AtomicU32 = AtomicU32::new(0);
+    static LEFT: AtomicU64 = AtomicU64::new(0);
+    let Some((at, frames)) = *ASKED.get_or_init(|| {
+        let v = std::env::var("VICTORY_PIX_CAPTURE_AT").ok()?;
+        let mut it = v.split(',');
+        let at = it.next()?.trim().parse::<u64>().ok()?;
+        let frames = it.next().and_then(|f| f.trim().parse::<u32>().ok()).unwrap_or(1).max(1);
+        Some((at, frames))
+    }) else {
+        return;
+    };
+    let start = *START.get_or_init(std::time::Instant::now);
+    // SAFETY: a plain query for a debug interface; absent without PIX.
+    let analysis = || unsafe { DXGIGetDebugInterface1::<IDXGraphicsAnalysis>(0) }.ok();
+    match STATE.load(Ordering::Relaxed) {
+        0 if start.elapsed().as_secs() >= at => {
+            if let Some(a) = analysis() {
+                // SAFETY: as documented: a capture begins at this present.
+                unsafe { a.BeginCapture() };
+                LEFT.store(u64::from(frames), Ordering::Relaxed);
+                STATE.store(1, Ordering::Relaxed);
+                tracing::info!(frames, "PIX capture begun (VICTORY_PIX_CAPTURE_AT)");
+            } else {
+                STATE.store(2, Ordering::Relaxed);
+                tracing::warn!("VICTORY_PIX_CAPTURE_AT: no graphics analysis interface (not launched under PIX)");
+            }
+        }
+        1 => {
+            if LEFT.fetch_sub(1, Ordering::Relaxed) <= 1 {
+                if let Some(a) = analysis() {
+                    // SAFETY: ends the capture begun above.
+                    unsafe { a.EndCapture() };
+                }
+                STATE.store(2, Ordering::Relaxed);
+                tracing::info!("PIX capture ended");
+            }
+        }
+        _ => {}
+    }
 }
